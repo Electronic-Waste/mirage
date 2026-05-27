@@ -1086,6 +1086,11 @@ __device__ __forceinline__ void execute_scheduler(RuntimeConfig config,
   int const num_schedulers_per_sm = std::min((int)blockDim.x / 32, 4);
   int const warp_id = threadIdx.x / 32;
   // CANNOT use syncthreads below
+
+#ifdef MPK_ENABLE_PROFILING
+  PROFILER_CLOSURE_PARAMS_DECL;
+#endif
+
   if (threadIdx.x % 32 == 0 && warp_id < num_schedulers_per_sm) {
     int const sched_id = blockIdx.x * num_schedulers_per_sm + warp_id + offset;
     // if (threadIdx.x == 0) {
@@ -1097,6 +1102,17 @@ __device__ __forceinline__ void execute_scheduler(RuntimeConfig config,
     sched_queues[0] = config.sched_queues[sched_id];
     sched_queue_ids[0] = sched_id;
     unsigned long long int my_first_worker, my_last_worker;
+
+#ifdef MPK_ENABLE_PROFILING
+    // Up to 4 scheduler warps share one block but the profiler has one
+    // slot per block (num_groups=1).  Only warp 0 writes so events from
+    // different warps don't interleave.
+    PROFILER_INIT(static_cast<uint64_t *>(config.profiler_buffer),
+                  0,
+                  1,
+                  (warp_id == 0));
+    uint32_t sched_profiling_cnt = 0;
+#endif
 
     if (sched_id < config.num_local_schedulers) {
       // local schedulers also (collectively) process events from
@@ -1215,14 +1231,26 @@ __device__ __forceinline__ void execute_scheduler(RuntimeConfig config,
 #else // MPK_TEST_MODE
 
         // Check if we want to continue
+#ifdef MPK_ENABLE_PROFILING
+        PROFILER_EVENT_START(TASK_SCHD_PREPARE_BATCH,
+                             sched_profiling_cnt);
+#endif
 #ifdef MODE_ONLINE_NOTOKEN
         if (!prepare_next_batch(config, iteration_num))
 #else
         if (!prepare_next_batch(config))
 #endif
         {
+#ifdef MPK_ENABLE_PROFILING
+          PROFILER_EVENT_END(TASK_SCHD_PREPARE_BATCH,
+                             sched_profiling_cnt++);
+#endif
           terminate_schedulers(config);
         } else {
+#ifdef MPK_ENABLE_PROFILING
+          PROFILER_EVENT_END(TASK_SCHD_PREPARE_BATCH,
+                             sched_profiling_cnt++);
+#endif
           // Launch task 1 (begin_task_graph) for the next iteration
           size_t last_task_id =
               worker_queue_next_free_task_pos[next_worker - my_first_worker]++;
