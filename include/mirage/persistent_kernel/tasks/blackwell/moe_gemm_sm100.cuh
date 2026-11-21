@@ -299,9 +299,11 @@ __device__ __forceinline__ long long mxg_now() {
       mxg_tr[(slot)] += mxg_now() - (t0);                                      \
     }                                                                          \
   } while (0)
+#define MXG_TRACE_INPUTS 1
 #else
 #define MXG_T(slot)
 #define MXG_TADD(slot, t0)
+#define MXG_TRACE_INPUTS 0
 #endif
 
 // the four warps of rows 0 .. 127 (the epilogue's)
@@ -458,6 +460,14 @@ __device__ __forceinline__ void
 // the rows are (gate, up) pairs and the output is
 //   (clamp(up, -LIMIT, LIMIT) + OFF) * g * sigmoid(ALPHA * g), g = min(gate, LIMIT)
 // (LIMIT = inf, OFF = 0, ALPHA = 1: SiLU(gate) * up).
+// DENSE: an ordinary linear layer on the same machinery -- one "expert", every
+// token, in passes of NT; the inputs are [0] activations [BATCH][K], [1] the
+// packed weight, then (HAS_BIAS) bias bf16 [ROWS] and (RES) a residual bf16
+// [BATCH][OSTRIDE]; the output is bf16 [BATCH][OSTRIDE]. FUSE rounds
+// product + bias once (a linear layer) instead of the product first (the
+// experts' bmm, then the bias); the residual is added to the rounded value.
+// HELD: the worker holds its TMEM for the whole iteration (tmem_hold_sm100 /
+// tmem_release_sm100) instead of this task allocating and freeing it.
 // Warps: 0 .. 3 the 128 rows (dequantization, epilogue), 4 the weight copies,
 // 5 the MMAs, 6 .. 7 the activation gather.
 // ---------------------------------------------------------------------------
@@ -477,6 +487,11 @@ template <int MX,
           int LIMIT_BITS,
           int ALPHA_BITS,
           int OFF_BITS,
+          int DENSE,
+          int RES,
+          int FUSE,
+          int HELD,
+          int OSTRIDE,
           class TD,
           class RC>
 __device__ __forceinline__ void
@@ -528,18 +543,30 @@ __device__ __forceinline__ void
 
   const char *x = static_cast<const char *>(task_desc->input_ptrs[0]);
   const char *wpack = static_cast<const char *>(task_desc->input_ptrs[1]);
-  const int *rlist = static_cast<const int *>(task_desc->input_ptrs[2]);
-  const int *meta = static_cast<const int *>(task_desc->input_ptrs[3]);
+  constexpr int IDX_BIAS = DENSE ? 2 : 4;
+  constexpr int IDX_RES = IDX_BIAS + HAS_BIAS;
+  constexpr int OS = OSTRIDE ? OSTRIDE : OUT; // the output's row stride
+  constexpr int NPASS = (BATCH + NT - 1) / NT;
+  static_assert(!DENSE || (E_TOT == 1 && SLOTS == 1 && !IN_SLOTTED), "dense");
+  static_assert(!RES || !ACT, "a residual goes with a plain output");
+  const int *rlist =
+      DENSE ? nullptr : static_cast<const int *>(task_desc->input_ptrs[2]);
+  const int *meta =
+      DENSE ? nullptr : static_cast<const int *>(task_desc->input_ptrs[3]);
   const unsigned short *bias =
-      HAS_BIAS ? static_cast<const unsigned short *>(task_desc->input_ptrs[4])
-               : nullptr;
+      HAS_BIAS
+          ? static_cast<const unsigned short *>(task_desc->input_ptrs[IDX_BIAS])
+          : nullptr;
+  const unsigned short *resid =
+      RES ? static_cast<const unsigned short *>(task_desc->input_ptrs[IDX_RES])
+          : nullptr;
   unsigned short *out =
       static_cast<unsigned short *>(task_desc->output_ptrs[0]);
   const int task_i = static_cast<int>(task_desc->task_metadata.ext_bid_x);
   const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
 #ifdef MXG_TRACE
   long long *mxg_tr =
-      static_cast<long long *>(task_desc->input_ptrs[4 + HAS_BIAS]) +
+      static_cast<long long *>(task_desc->input_ptrs[IDX_RES + RES]) +
       static_cast<size_t>(blockIdx.x) * MXG_TRACE_N;
   if (tid == 0) {
     for (int i = 0; i < MXG_TRACE_N; ++i) {
@@ -567,13 +594,17 @@ __device__ __forceinline__ void
   int *elist = ut + 4 * MAXU;                        // [2][NT]
   int *misc = elist + 2 * NT;                        // n_ep, tmem base
 
-  if (tid == 0) {
-    misc[0] = meta[0];
+  int n_ep = NPASS;
+  if (!DENSE) {
+    if (tid == 0) {
+      misc[0] = meta[0];
+    }
+    __syncthreads();
+    n_ep = misc[0];
   }
-  __syncthreads();
-  const int total = misc[0] * RB;
+  const int total = n_ep * RB;
   const int n_my = total > task_i ? (total - task_i - 1) / G + 1 : 0;
-  if (n_my > MAXU) {
+  if (!DENSE && n_my > MAXU) {
     __trap();
   }
   if (n_my == 0) {
@@ -586,7 +617,7 @@ __device__ __forceinline__ void
     mxg_tr[6] = task_i;
   }
 #endif
-  if (tid < n_my) {
+  if (!DENSE && tid < n_my) {
     const int u = task_i + tid * G;
     const int ent = meta[1 + u / RB];
     const int e = ent >> 16, p = ent & 0xffff;
@@ -619,18 +650,63 @@ __device__ __forceinline__ void
     }
     asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
   }
-  if (warp == 0) {
+  // HELD: the worker's TMEM stays allocated from its first GEMM task of the
+  // iteration (which records the address, top bit set, in the token tensor)
+  // to the release wave.
+  int *held_tok =
+      HELD ? static_cast<int *>(
+                 task_desc->input_ptrs[IDX_RES + RES + MXG_TRACE_INPUTS]) +
+                 blockIdx.x
+           : nullptr;
+  if (HELD) {
+    if (tid == 0) {
+      misc[2] = *held_tok;
+    }
+    __syncthreads();
+  }
+  const bool have_tmem = HELD && misc[2] < 0;
+  if (!have_tmem && warp == 0) {
     tmem_alloc512(reinterpret_cast<unsigned *>(&misc[1]));
     tmem_fence_before();
   }
   __syncthreads();
   tmem_fence_after();
+  if (have_tmem) {
+    if (tid == 0) {
+      misc[1] = misc[2] & 0x7fffffff;
+    }
+  } else if (HELD && tid == 0) {
+    *held_tok = misc[1] | static_cast<int>(0x80000000u);
+  }
+  if (HELD) {
+    __syncthreads();
+  }
 #ifdef MXG_TRACE
   if (tid == 0) {
     MXG_T(2);
   }
 #endif
   const unsigned tb = static_cast<unsigned>(misc[1]); // accumulators
+  // unit j of this task: expert, pass, row block, tokens
+  auto unit_at = [&](int j, int &e, int &p, int &rb, int &n) {
+    if (DENSE) {
+      const int u = task_i + j * G;
+      e = 0;
+      p = u / RB;
+      rb = u % RB;
+      const int left = BATCH - p * NT;
+      n = left < NT ? left : NT;
+    } else {
+      e = ut[j * 4 + 0];
+      p = ut[j * 4 + 1];
+      rb = ut[j * 4 + 2];
+      n = ut[j * 4 + 3];
+    }
+  };
+  // entry ci of a pass's token list: (token << 8) | slot
+  auto entry_at = [&](const int *el, int p, int ci) {
+    return DENSE ? ((p * NT + ci) << 8) : el[ci];
+  };
   const unsigned ta = tb + AS * ACC_COLS;             // MX: A stages
   const float LIMIT = __int_as_float(LIMIT_BITS);
   const float ALPHA = __int_as_float(ALPHA_BITS);
@@ -645,7 +721,8 @@ __device__ __forceinline__ void
     float bias_v[2] = {0.f, 0.f}; // of the units in flight (by parity)
     int epi = 0;                  // the units whose epilogue has run
     auto epilogue = [&](int j) {
-      const int rb = ut[j * 4 + 2], n = ut[j * 4 + 3];
+      int e_, p_, rb, n;
+      unit_at(j, e_, p_, rb, n);
       const int grow = rb * 128 + row;
       const int *el = elist + (j & 1) * NT;
       const float bv = bias_v[j & 1];
@@ -679,7 +756,8 @@ __device__ __forceinline__ void
         for (int c = 0; c < 16; ++c) {
           const int ci = c0 + c;
           // as the reference: the product rounded to bf16, then the bias
-          const float y = bfround(acc[c]) + bv;
+          // (FUSE: a linear layer's product + bias, rounded once below)
+          const float y = (FUSE ? acc[c] : bfround(acc[c])) + bv;
           if (ACT) {
             const float yr = bfround(y);
             const float o = __shfl_xor_sync(0xffffffffu, yr, 1);
@@ -687,14 +765,16 @@ __device__ __forceinline__ void
               const float g = fminf(yr, LIMIT);
               const float u = fminf(fmaxf(o, -LIMIT), LIMIT);
               const float sg = 1.f / (1.f + __expf(fminf(-ALPHA * g, 40.f)));
-              const int ent = el[ci];
-              out[(static_cast<size_t>(ent >> 8) * SLOTS + (ent & 0xff)) * OUT +
+              const int ent = entry_at(el, p_, ci);
+              out[(static_cast<size_t>(ent >> 8) * SLOTS + (ent & 0xff)) * OS +
                   rb * 64 + (row >> 1)] = f2bf((u + OFF) * g * sg);
             }
           } else if (ci < n && grow < ROWS) {
-            const int ent = el[ci];
-            out[(static_cast<size_t>(ent >> 8) * SLOTS + (ent & 0xff)) * OUT +
-                grow] = f2bf(y);
+            const int ent = entry_at(el, p_, ci);
+            const size_t o =
+                (static_cast<size_t>(ent >> 8) * SLOTS + (ent & 0xff)) * OS +
+                grow;
+            out[o] = f2bf(RES ? bfround(y) + bf2f(resid[o]) : y);
           }
         }
       }
@@ -712,8 +792,8 @@ __device__ __forceinline__ void
     int gs = 0;
 #pragma unroll 1
     for (int j = 0; j < n_my; ++j) {
-      const int e = ut[j * 4 + 0], p = ut[j * 4 + 1], rb = ut[j * 4 + 2];
-      const int n = ut[j * 4 + 3];
+      int e, p, rb, n;
+      unit_at(j, e, p, rb, n);
       const int grow = rb * 128 + row;
       // unit j takes over unit j - 2's list and accumulator stage
       if (epi + 2 <= j) {
@@ -722,7 +802,7 @@ __device__ __forceinline__ void
         ++epi;
       }
       rows_sync();
-      if (row < n) {
+      if (!DENSE && row < n) {
         elist[(j & 1) * NT + row] =
             rlist[static_cast<size_t>(e) * BATCH + p * NT + row];
       }
@@ -730,6 +810,7 @@ __device__ __forceinline__ void
       if (HAS_BIAS && grow < ROWS) {
         bias_v[j & 1] = bf2f(bias[static_cast<size_t>(e) * ROWS + grow]);
       }
+      // (a dense layer's e is 0: bias [ROWS])
       rows_sync();
 #ifdef MXG_TRACE
       if (tid == 0 && j < 4) {
@@ -856,7 +937,8 @@ __device__ __forceinline__ void
       int gs = 0;
 #pragma unroll 1
       for (int j = 0; j < n_my; ++j) {
-        const int e = ut[j * 4 + 0], rb = ut[j * 4 + 2];
+        int e, p_, rb, n_;
+        unit_at(j, e, p_, rb, n_);
         const char *src =
             wpack + static_cast<size_t>(e * RB + rb) * NKB * ABLK;
 #pragma unroll 1
@@ -879,7 +961,8 @@ __device__ __forceinline__ void
       int gs = 0;
 #pragma unroll 1
       for (int j = 0; j < n_my; ++j) {
-        const int n = ut[j * 4 + 3];
+        int e_, p_, rb_, n;
+        unit_at(j, e_, p_, rb_, n);
         const int nr = n > 16 ? (n + 15) & ~15 : 16;
         const uint32_t ides = idesc(128, nr);
         const int st = j % AS;
@@ -979,14 +1062,17 @@ __device__ __forceinline__ void
     int gs = 0;
 #pragma unroll 1
     for (int j = 0; j < n_my; ++j) {
-      const int e = ut[j * 4 + 0], p = ut[j * 4 + 1], n = ut[j * 4 + 3];
+      int e, p, rb_, n;
+      unit_at(j, e, p, rb_, n);
       const char *src[NTL];
 #pragma unroll
       for (int it = 0; it < NTL; ++it) {
         const int jt = tsub + 8 * it;
         src[it] = nullptr;
         if (jt < n) {
-          const int ent = rlist[static_cast<size_t>(e) * BATCH + p * NT + jt];
+          const int ent =
+              DENSE ? ((p * NT + jt) << 8)
+                    : rlist[static_cast<size_t>(e) * BATCH + p * NT + jt];
           const size_t r = IN_SLOTTED ? static_cast<size_t>(ent >> 8) * SLOTS +
                                             (ent & 0xff)
                                       : static_cast<size_t>(ent >> 8);
@@ -1016,7 +1102,7 @@ __device__ __forceinline__ void
     }
   }
   __syncthreads();
-  if (warp == 0) {
+  if (!HELD && warp == 0) {
     tmem_free512(tb);
   }
 #ifdef MXG_TRACE
@@ -1095,6 +1181,30 @@ __device__ __forceinline__ void
                (static_cast<unsigned>(f2bf(bf2f(q[j] >> 16) + hi)) << 16);
       }
       y[static_cast<size_t>(t) * NCHUNK + c] = o;
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// The end of an iteration's held TMEM: a wave of exactly num_workers tasks
+// (one a worker: task k of an iteration runs on worker k % num_workers) frees
+// what the workers' HELD GEMM tasks allocated and clears the token tensor
+// (int32 [num_workers], input TOKEN_INPUT). Holding saves the allocation and
+// the release in every GEMM task, about 1.5 us each. Every TMEM user of the
+// iteration must be a HELD task: one that allocates on a worker that holds
+// all 512 columns waits forever.
+// ---------------------------------------------------------------------------
+template <int TOKEN_INPUT, class TD, class RC>
+__device__ __forceinline__ void
+    tmem_release_sm100(TD const *task_desc, RC const &runtime_config) {
+  int *tok = static_cast<int *>(task_desc->input_ptrs[TOKEN_INPUT]) + blockIdx.x;
+  const int v = *tok;
+  if (v < 0) {
+    if ((threadIdx.x >> 5) == 0) {
+      mxg::tmem_free512(static_cast<unsigned>(v & 0x7fffffff));
+    }
+    if (threadIdx.x == 0) {
+      *tok = 0;
     }
   }
 }

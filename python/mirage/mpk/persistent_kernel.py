@@ -2415,6 +2415,7 @@ class PersistentKernel:
         bias: DTensor = None,
         num_tasks: int = None,
         trace: DTensor = None,
+        tmem: DTensor = None,
     ):
         """One wave of an expert GEMM over a route plan.
 
@@ -2453,13 +2454,77 @@ class PersistentKernel:
             assert bias.dim(0) == e_tot and bias.dim(1) == rows
             inputs.append(bias)
         if trace is not None:
-            # int64 [workers, 64] time stamps; needs -DMXG_TRACE (tuning aid)
+            # int64 [workers, 256] time stamps; needs -DMXG_TRACE (tuning aid)
             inputs.append(trace)
+        if tmem is not None:
+            inputs.append(tmem)  # (tmem_hold_layer's token: order only)
         self.ext_layer(
             "moe_gemm_sm100", inputs, [output], (g, 1, 1),
             [1 if mxfp4 else 0, 0 if act is None else 1,
              0 if bias is None else 1, 1 if slotted else 0,
-             batch, e_tot, slots, nt, k, rows, kb, g, cap] + bits)
+             batch, e_tot, slots, nt, k, rows, kb, g, cap] + bits +
+            [0, 0, 0, 0 if tmem is None else 1, 0])
+
+    def tmem_release_layer(self, after, token: DTensor, done: DTensor):
+        """The end of the iteration's held TMEM.
+
+        GEMM layers given tmem=token (an attached int32 [num_workers] tensor
+        of zeros) keep their worker's TMEM allocated from task to task; this
+        wave, one task a worker, frees it. `after` is the output (or outputs)
+        of the iteration's last GEMM layers, `done` (int32 [num_workers]) a
+        tensor nothing reads. Every GEMM layer of the graph must be given the
+        token: a task that allocated TMEM itself would wait forever on a
+        worker that holds all of it.
+        """
+        after = list(after) if isinstance(after, (list, tuple)) else [after]
+        self.ext_layer("tmem_release_sm100", after + [token], [done],
+                       (self.num_workers, 1, 1), [len(after)])
+
+    def dense_gemm_layer(
+        self,
+        input: DTensor,
+        weight: DTensor,
+        output: DTensor,
+        rows: int,
+        bias: DTensor = None,
+        residual: DTensor = None,
+        tmem: DTensor = None,
+        num_tasks: int = None,
+    ):
+        """output[:, :rows] = input @ W^T (+ bias) (+ residual), a linear
+        layer on moe_gemm_layer's machinery: W packed by
+        moe_pack.pack_bf16_tiles ([1, row blocks, K / 64, 8192]), its 128-row
+        blocks dealt over the wave's tasks, the tokens in passes of up to 128
+        (the weight is read once a pass, not once every 16 tokens).
+
+        input [batch, K], output and residual [batch, >= rows], bias [rows],
+        all bf16. product + bias is rounded once, then the residual is added.
+        """
+        from .moe_pack import moe_tokens_per_pass
+        assert self.target_cc in (100, 103)
+        g = self.num_workers if num_tasks is None else num_tasks
+        batch, k = input.dim(0), input.dim(1)
+        rb = (rows + 127) // 128
+        nt = moe_tokens_per_pass(batch)
+        kb = 128 if k % 128 == 0 else 64
+        assert weight.dim(0) == 1 and weight.dim(1) == rb
+        assert weight.dim(2) * 64 == k
+        assert output.dim(0) == batch and output.dim(1) >= rows
+        inputs = [input, weight]
+        if bias is not None:
+            assert bias.num_dims == 1 and bias.dim(0) == rows
+            inputs.append(bias)
+        if residual is not None:
+            assert residual.dim(1) == output.dim(1)
+            inputs.append(residual)
+        if tmem is not None:
+            inputs.append(tmem)
+        self.ext_layer(
+            "moe_gemm_sm100", inputs, [output], (g, 1, 1),
+            [0, 0, 0 if bias is None else 1, 0, batch, 1, 1, nt, k, rows, kb,
+             g, 0, 0, 0, 0,
+             1, 0 if residual is None else 1, 1, 0 if tmem is None else 1,
+             output.dim(1)])
 
     def moe_combine_layer(
         self,

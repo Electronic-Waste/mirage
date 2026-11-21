@@ -96,13 +96,19 @@ def main():
     act = torch.zeros(B, SLOTS, I, dtype=bf, device=dev)
     out = torch.zeros(B, SLOTS, H, dtype=bf, device=dev)
 
-    # ---- graph
+    # ---- graph. Unless TEST_NO_HOLD is set the workers keep their TMEM
+    # from their first GEMM task to a release wave at the end.
+    held = os.environ.get("TEST_NO_HOLD") is None
+    tm_token = torch.zeros(num_workers, dtype=torch.int32, device=dev)
+    tm_done = torch.zeros(num_workers, dtype=torch.int32, device=dev)
+    d_logits = pk.attach_input(logits_all, name="logits")
+    d_tok = pk.attach_input(tm_token, name="tmem_token") if held else None
     d_w, d_l, d_m = (pk.attach_input(weight, name="route_weight"),
                      pk.attach_input(rlist, name="route_list"),
                      pk.attach_input(rmeta, name="route_meta"))
     d_act = pk.attach_input(act, name="act")
     pk.moe_route_layer(
-        logits=pk.attach_input(logits_all, name="logits"), weight=d_w,
+        logits=d_logits, weight=d_w,
         route_list=d_l, route_meta=d_m, nt=nt, num_experts=E,
         shared=bool(shared))
     pk.moe_gemm_layer(
@@ -110,20 +116,38 @@ def main():
         weight=pk.attach_input(w13p, name="w13"), route_list=d_l,
         route_meta=d_m, output=d_act, nt=nt, mxfp4=mx, rows=2 * I,
         act=(limit, alpha, off),
-        bias=pk.attach_input(b13, name="b13") if mx else None)
+        bias=pk.attach_input(b13, name="b13") if mx else None, tmem=d_tok)
     pk.moe_gemm_layer(
         input=d_act, weight=pk.attach_input(w2p, name="w2"), route_list=d_l,
         route_meta=d_m, output=(d_out := pk.attach_input(out, name="out")),
         nt=nt,
         mxfp4=mx, rows=H,
-        bias=pk.attach_input(b2, name="b2") if mx else None)
+        bias=pk.attach_input(b2, name="b2") if mx else None, tmem=d_tok)
 
     residual = (torch.randn(B, H, device=dev) * 0.5).to(bf)
     comb = torch.zeros(B, H, dtype=bf, device=dev)
     pk.moe_combine_layer(
         input=d_out, weight=d_w,
         residual=pk.attach_input(residual, name="residual"),
-        output=pk.attach_input(comb, name="comb"), shared=bool(shared))
+        output=(d_comb := pk.attach_input(comb, name="comb")),
+        shared=bool(shared))
+
+    # ---- a dense linear layer on the same task: bias, residual, and the
+    # workers holding their TMEM across the wave
+    DR = 2 * H - 64                      # rows: not a multiple of 128
+    wd = (torch.randn(1, DR, H, device=dev) * 0.05).to(bf)
+    bd = (torch.randn(DR, device=dev) * 0.2).to(bf)
+    rd = (torch.randn(B, DR + 64, device=dev) * 0.5).to(bf)
+    yd = torch.zeros(B, DR + 64, dtype=bf, device=dev)
+    d_x2 = pk.attach_input(x.clone(), name="x_dense")
+    d_yd = pk.attach_input(yd, name="y_dense")
+    pk.dense_gemm_layer(
+        input=d_x2, weight=pk.attach_input(moe_pack.pack_bf16_tiles(wd), name="w_dense"),
+        output=d_yd, rows=DR, bias=pk.attach_input(bd, name="b_dense"),
+        residual=pk.attach_input(rd, name="r_dense"), tmem=d_tok)
+    if held:
+        pk.tmem_release_layer([d_comb, d_yd], d_tok,
+                              pk.attach_input(tm_done, name="tmem_done"))
 
     print("Compiling test kernel...")
     pk.compile(output_dir=os.path.dirname(os.path.abspath(__file__)))
@@ -200,6 +224,12 @@ def main():
     check("w13 + activation", act, act_ref, 0.02)
     check("w2", out, out_ref, 0.02)
     check("combine", comb, comb_ref, 0.02)
+    yd_ref = bfr(bfr(x.float() @ wd[0].float().T + bd.float()) +
+                 rd.float()[:, :DR])
+    check("dense + bias + residual", yd[:, :DR], yd_ref, 0.02)
+    if float(yd[:, DR:].abs().max()) != 0:
+        ok = False
+        print("[dense] FAILED: wrote past its rows")
 
     pk.finalize()
     if not ok:
