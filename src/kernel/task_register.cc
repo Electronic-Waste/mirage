@@ -57,7 +57,7 @@ int TaskRegister::register_ext_task(runtime::TaskType type,
     }
     call += ">";
   }
-  call += "(task_desc);\n";
+  call += "(task_desc, runtime_config);\n";
   return register_task_variant(type, call);
 }
 

@@ -3,11 +3,35 @@ import torch
 from ..graph_builder import GraphBuilder
 from ..utils import grid_for_rmsnorm_linear_layer, shuffle_tensors
 from ...kv_planner import KVCachePlan, KVSpec, plan_kv_groups
+from ... import moe_pack
 from ...persistent_kernel import PersistentKernel
 from ...model_registry import register_model_builder
 from ....core import bfloat16, float32, int32, int64
 
+import glob
+import os
 from typing import Optional
+
+
+def load_checkpoint_tensors(source: str) -> dict:
+    """The checkpoint's tensors as stored (on the host, nothing converted):
+    the released GPT-OSS keeps its expert weights as MXFP4 blocks and scales."""
+    from safetensors import safe_open
+
+    if os.path.isdir(source):
+        root = source
+    else:
+        from huggingface_hub import snapshot_download
+        root = snapshot_download(
+            source, allow_patterns=["*.json", "model*.safetensors"])
+    files = sorted(glob.glob(os.path.join(root, "model*.safetensors")))
+    assert files, f"no model*.safetensors in {root}"
+    tensors = {}
+    for f in files:
+        with safe_open(f, framework="pt", device="cpu") as sf:
+            for k in sf.keys():
+                tensors[k] = sf.get_tensor(k)
+    return tensors
 
 
 # The SM100 linear and the MoE group GEMM both want each task's output column
@@ -51,8 +75,14 @@ class GptOssBuilder(GraphBuilder):
     """
 
     def __init__(self, mpk: PersistentKernel, weights: Optional[dict] = None,
-                 kv_plan: Optional[KVCachePlan] = None):
+                 kv_plan: Optional[KVCachePlan] = None,
+                 moe: str = "plan"):
+        """moe: "plan" runs the experts with moe_route_layer / moe_gemm_layer
+        (the released MXFP4 weights as they are, or a bf16 checkpoint);
+        "legacy" keeps the bf16-only moe_w13 / moe_w2 linear layers."""
         super().__init__(mpk, weights)
+        assert moe in ("plan", "legacy")
+        self.moe = moe
         self.max_num_pages = mpk.max_num_pages
         self.kv_plan = kv_plan
         self.world_size = mpk.world_size
@@ -66,17 +96,22 @@ class GptOssBuilder(GraphBuilder):
     # ---------------------------------------------------------------- loading
 
     def build_from_model(self, model_name: str, model_path: str | None = None):
-        from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
+        from transformers import AutoConfig, AutoTokenizer
+        from transformers.models.gpt_oss.modeling_gpt_oss import (
+            GptOssRotaryEmbedding)
 
         source = model_path or model_name
         self.config = AutoConfig.from_pretrained(source)
         assert self.world_size == 1, "GPT-OSS is single-GPU for now"
 
-        # Loaded on the host: the conversions below transpose and
-        # de-interleave whole expert tensors, so holding both copies on the
-        # GPU would need twice the model. _attach moves each one over.
-        model = AutoModelForCausalLM.from_pretrained(
-            source, dtype=torch.bfloat16, device_map="cpu")
+        # Loaded on the host as stored: the conversions below permute whole
+        # expert tensors, so holding both copies on the GPU would need twice
+        # the model. _attach moves each one over.
+        state_dict = load_checkpoint_tensors(source)
+        self.mxfp4 = any(k.endswith("gate_up_proj_blocks") for k in state_dict)
+        assert self.moe == "plan" or not self.mxfp4, (
+            "the legacy MoE layers take a bf16 checkpoint "
+            "(Mxfp4Config(dequantize=True)); moe=\"plan\" runs MXFP4")
         self.tokenizer = AutoTokenizer.from_pretrained(source)
         self.eos_token_id = self.config.eos_token_id
 
@@ -105,7 +140,7 @@ class GptOssBuilder(GraphBuilder):
         # so duplicate them.
         dummy = torch.empty(0, dtype=torch.bfloat16)
         positions = torch.arange(self.mpk.max_seq_length).unsqueeze(0)
-        cos, sin = model.model.rotary_emb(dummy, positions)
+        cos, sin = GptOssRotaryEmbedding(self.config)(dummy, positions)
         self.cos_table = torch.cat([cos[0], cos[0]], dim=-1).contiguous().to(torch.bfloat16)
         self.sin_table = torch.cat([sin[0], sin[0]], dim=-1).contiguous().to(torch.bfloat16)
 
@@ -125,7 +160,6 @@ class GptOssBuilder(GraphBuilder):
              for g in self.kv_plan.groups},
             max_num_pages=self.max_num_pages)
 
-        state_dict = model.state_dict()
         self.build_from_dict(state_dict, with_lm_head=True)
 
     def build_from_config(self, model_config):
@@ -170,6 +204,27 @@ class GptOssBuilder(GraphBuilder):
                 self._attach(w2, f"layer_{i}_w2"),
                 self._attach(b2, f"layer_{i}_b2"))
 
+    def _experts_packed(self, sd, prefix, i):
+        """The expert weights in moe_gemm_layer's layouts. Rows stay in the
+        checkpoint's order: gate and up interleaved (the activation takes
+        them as pairs), and so do the biases."""
+        e = f"{prefix}mlp.experts."
+        if self.mxfp4:
+            w13 = moe_pack.pack_mxfp4(sd[e + "gate_up_proj_blocks"],
+                                      sd[e + "gate_up_proj_scales"])
+            w2 = moe_pack.pack_mxfp4(sd[e + "down_proj_blocks"],
+                                     sd[e + "down_proj_scales"])
+        else:
+            # dequantized: gate_up [E, hidden, 2I], down [E, I, hidden]
+            w13 = moe_pack.pack_bf16_tiles(
+                sd[e + "gate_up_proj"].permute(0, 2, 1).contiguous())
+            w2 = moe_pack.pack_bf16_tiles(
+                sd[e + "down_proj"].permute(0, 2, 1).contiguous())
+        return (self._attach(w13, f"layer_{i}_w13"),
+                self._attach(sd[e + "gate_up_proj_bias"], f"layer_{i}_b13"),
+                self._attach(w2, f"layer_{i}_w2"),
+                self._attach(sd[e + "down_proj_bias"], f"layer_{i}_b2"))
+
     # ------------------------------------------------------------------ graph
 
     def build_from_dict(self, state_dict: dict, with_lm_head: bool):
@@ -209,6 +264,12 @@ class GptOssBuilder(GraphBuilder):
                                                name="moe_topk_weight", io_category="cuda_tensor")
         self.routing_indices = self.mpk.new_tensor(dims=(self.num_experts, mbt), dtype=int32,
                                                    name="moe_routing_indices", io_category="cuda_tensor")
+        if self.moe == "plan":
+            self.moe_nt = moe_pack.moe_tokens_per_pass(mbt)
+            cap = moe_pack.moe_plan_cap(mbt, self.num_experts, topk, self.moe_nt)
+            self.route_meta = self.mpk.new_tensor(
+                dims=(1 + cap + self.num_experts,), dtype=int32,
+                name="moe_route_meta", io_category="cuda_tensor")
         self.moe_mask = self.mpk.new_tensor(dims=(self.num_experts + 1,), dtype=int32,
                                             name="moe_mask", io_category="cuda_tensor")
         self.mlp_mid = self.mpk.new_tensor(dims=(mbt, topk, 2 * ii), dtype=bfloat16,
@@ -267,7 +328,10 @@ class GptOssBuilder(GraphBuilder):
         for i in range(self.num_layers):
             prefix = f"model.layers.{i}."
             w_qkv, b_qkv = self._fused_qkv(sd, prefix, i)
-            w13, b13, w2, b2 = self._experts(sd, prefix, i)
+            if self.moe == "plan":
+                w13, b13, w2, b2 = self._experts_packed(sd, prefix, i)
+            else:
+                w13, b13, w2, b2 = self._experts(sd, prefix, i)
 
             self.mpk.rmsnorm_layer(
                 input=self.x,
@@ -342,24 +406,42 @@ class GptOssBuilder(GraphBuilder):
                 bias=self._attach(sd[f"{prefix}mlp.router.bias"].view(1, -1),
                                   f"layer_{i}_router_bias"),
                 output=self.gate_out, grid_dim=(1, 1, 1), block_dim=(256, 1, 1))
-            self.mpk.moe_topk_softmax_routing_layer(
-                input=self.gate_out,
-                output=(self.topk_weight, self.routing_indices, self.moe_mask),
-                grid_dim=(1, 1, 1), block_dim=(256, 1, 1))
-            self.mpk.moe_w13_linear_layer(
-                input=self.rmsnorm_out, weight=w13, bias=b13,
-                moe_routing_indices=self.routing_indices, moe_mask=self.moe_mask,
-                output=self.mlp_mid,
-                grid_dim=(10, _grid_x(2 * ii, 128), 1), block_dim=(256, 1, 1))
-            self.mpk.moe_clamped_swiglu_layer(
-                input=self.mlp_mid, output=self.swiglu_out,
-                grid_dim=(mbt, topk, 1), block_dim=(256, 1, 1),
-                limit=self.swiglu_limit, alpha=1.702)
-            self.mpk.moe_w2_linear_layer(
-                input=self.swiglu_out, weight=w2, bias=b2,
-                moe_routing_indices=self.routing_indices, moe_mask=self.moe_mask,
-                output=self.mlp_out,
-                grid_dim=(8, _grid_x(h, 64), 1), block_dim=(256, 1, 1))
+            if self.moe == "plan":
+                # (routing_indices holds the plan's token lists here)
+                self.mpk.moe_route_layer(
+                    logits=self.gate_out, weight=self.topk_weight,
+                    route_list=self.routing_indices,
+                    route_meta=self.route_meta, nt=self.moe_nt)
+                self.mpk.moe_gemm_layer(
+                    input=self.rmsnorm_out, weight=w13, bias=b13,
+                    route_list=self.routing_indices,
+                    route_meta=self.route_meta, output=self.swiglu_out,
+                    nt=self.moe_nt, mxfp4=self.mxfp4, rows=2 * ii,
+                    act=(self.swiglu_limit, 1.702, 1.0))
+                self.mpk.moe_gemm_layer(
+                    input=self.swiglu_out, weight=w2, bias=b2,
+                    route_list=self.routing_indices,
+                    route_meta=self.route_meta, output=self.mlp_out,
+                    nt=self.moe_nt, mxfp4=self.mxfp4, rows=h)
+            else:
+                self.mpk.moe_topk_softmax_routing_layer(
+                    input=self.gate_out,
+                    output=(self.topk_weight, self.routing_indices, self.moe_mask),
+                    grid_dim=(1, 1, 1), block_dim=(256, 1, 1))
+                self.mpk.moe_w13_linear_layer(
+                    input=self.rmsnorm_out, weight=w13, bias=b13,
+                    moe_routing_indices=self.routing_indices, moe_mask=self.moe_mask,
+                    output=self.mlp_mid,
+                    grid_dim=(10, _grid_x(2 * ii, 128), 1), block_dim=(256, 1, 1))
+                self.mpk.moe_clamped_swiglu_layer(
+                    input=self.mlp_mid, output=self.swiglu_out,
+                    grid_dim=(mbt, topk, 1), block_dim=(256, 1, 1),
+                    limit=self.swiglu_limit, alpha=1.702)
+                self.mpk.moe_w2_linear_layer(
+                    input=self.swiglu_out, weight=w2, bias=b2,
+                    moe_routing_indices=self.routing_indices, moe_mask=self.moe_mask,
+                    output=self.mlp_out,
+                    grid_dim=(8, _grid_x(h, 64), 1), block_dim=(256, 1, 1))
             self.mpk.moe_mul_sum_add_layer(
                 input=self.mlp_out, weight=self.topk_weight, residual=self.x,
                 output=self.mlp_sum_out,

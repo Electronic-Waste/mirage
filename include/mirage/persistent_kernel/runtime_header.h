@@ -224,7 +224,7 @@ enum TaskType {
   TASK_CLAMPED_SWIGLU = 451,
   // Header-only extension tasks. A layer registers "ext:<impl>" with the
   // params [num_inputs, num_outputs, slot, template args...]; its task body is
-  // kernel::<impl><template args...>(task_desc) and its type is
+  // kernel::<impl><template args...>(task_desc, runtime_config) and its type is
   // TASK_EXT_TASK_BEGIN + 1 + slot (one profiler id per slot). The grid
   // position of the task is in task_metadata (ext_bid_x / y / z).
   TASK_EXT_TASK_BEGIN = 460, // begin placeholder, not a real task

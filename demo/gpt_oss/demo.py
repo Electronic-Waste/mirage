@@ -1,9 +1,10 @@
 """GPT-OSS-20B on MPK. Pass --use-mirage for the megakernel, omit it for the
 HuggingFace reference.
 
-The checkpoint must be plain bf16. The released one is MXFP4, which MPK has no
-kernels for; convert it once with Mxfp4Config(dequantize=True).
-TODO: native MXFP4 support.
+The megakernel runs the released checkpoint: its MXFP4 expert weights stream
+as they are and are converted to bf16 exactly inside the expert GEMMs (--moe
+plan, the default). A bf16 checkpoint (Mxfp4Config(dequantize=True)) runs too,
+and is what the HuggingFace reference and --moe legacy need.
 """
 
 import argparse
@@ -25,9 +26,9 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--use-mirage", action="store_true",
                         help="Use Mirage kernels")
-    parser.add_argument("--model", type=str,
-                        default="/raid/catalyst/models/gpt-oss-20b-bf16",
-                        help="Local bf16 checkpoint directory")
+    parser.add_argument("--model", type=str, default="openai/gpt-oss-20b",
+                        help="The released checkpoint (MXFP4 experts, run as "
+                             "they are) or a local bf16 one")
     parser.add_argument("--prompt", type=str, default=DEFAULT_PROMPT)
     parser.add_argument("--raw-prompt", action="store_true",
                         help="Skip the chat template")
@@ -50,6 +51,10 @@ if __name__ == "__main__":
     parser.add_argument("--output-dir", help="Output files directory")
     parser.add_argument("--ignore-eos", action="store_true",
                         help="Ignore eos token during generation")
+    parser.add_argument("--moe", choices=["plan", "legacy"], default="plan",
+                        help="plan: route plan + packed expert GEMMs (the "
+                             "released MXFP4 checkpoint or a bf16 one); "
+                             "legacy: the bf16-only MoE linear layers")
     args = parser.parse_args()
 
     print("Input arguments:", args)
@@ -147,7 +152,7 @@ if __name__ == "__main__":
         )
 
         print("Building the task graph...")
-        GptOssBuilder(mpk, kv_plan=kv_plan).build_from_model(
+        GptOssBuilder(mpk, kv_plan=kv_plan, moe=args.moe).build_from_model(
             model_name=args.model, model_path=args.model)
         print("Compiling the megakernel...")
         mpk.compile(output_dir=args.output_dir)

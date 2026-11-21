@@ -60,9 +60,12 @@ def main():
     pk = PersistentKernel(**params)
 
     # ---- data
-    logits = (torch.randn(B, E, device=dev) -
-              a.skew * torch.arange(E, device=dev) / E).to(bf)
-    shared_logit = torch.randn(B, 1, device=dev).to(bf)
+    # the router's E logits, then (with --shared) the shared expert's gate logit
+    logits_all = torch.cat(
+        [torch.randn(B, E, device=dev) -
+         a.skew * torch.arange(E, device=dev) / E,
+         torch.randn(B, 8, device=dev)], dim=1).to(bf)
+    logits, shared_logit = logits_all[:, :E], logits_all[:, E:E + 1]
     x = (torch.randn(B, H, device=dev) * 0.5).to(bf)
     if mx:
         blk13 = torch.randint(0, 256, (E_TOT, 2 * I, H // 32, 16),
@@ -99,10 +102,9 @@ def main():
                      pk.attach_input(rmeta, name="route_meta"))
     d_act = pk.attach_input(act, name="act")
     pk.moe_route_layer(
-        logits=pk.attach_input(logits, name="logits"), weight=d_w,
-        route_list=d_l, route_meta=d_m, nt=nt,
-        shared_logit=(pk.attach_input(shared_logit, name="shared_logit")
-                      if shared else None))
+        logits=pk.attach_input(logits_all, name="logits"), weight=d_w,
+        route_list=d_l, route_meta=d_m, nt=nt, num_experts=E,
+        shared=bool(shared))
     pk.moe_gemm_layer(
         input=pk.attach_input(x, name="x"),
         weight=pk.attach_input(w13p, name="w13"), route_list=d_l,

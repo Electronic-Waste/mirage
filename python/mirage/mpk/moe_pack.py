@@ -6,8 +6,8 @@ import torch
 # Columns of one MXFP4 weight block (one bulk copy of the kernel).
 MXFP4_KB = 192
 # Block scales the kernel converts exactly: every e2m1 value times
-# 2^(s - 127), and 14 times it, must be normal bf16 numbers.
-MXFP4_SCALE_MIN, MXFP4_SCALE_MAX = 2, 250
+# 2^(s - 127) and 2^(s - 15) must be normal bf16 numbers.
+MXFP4_SCALE_MIN, MXFP4_SCALE_MAX = 2, 142
 
 
 def moe_tokens_per_pass(batch: int) -> int:

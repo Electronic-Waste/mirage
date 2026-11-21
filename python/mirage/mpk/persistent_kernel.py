@@ -2350,7 +2350,8 @@ class PersistentKernel:
         targs: list,
         block_dim: tuple = (256, 1, 1),
     ):
-        """Add a layer of grid_dim tasks that run kernel::<impl><targs>.
+        """Add a layer of grid_dim tasks that run
+        kernel::<impl><targs>(task_desc, runtime_config).
 
         No tensor is partitioned over the grid: every task sees the whole
         tensors (task_desc->input_ptrs / output_ptrs in the given order) and
@@ -2373,28 +2374,32 @@ class PersistentKernel:
         route_list: DTensor,
         route_meta: DTensor,
         nt: int,
-        shared_logit: DTensor = None,
+        num_experts: int = None,
+        shared: bool = False,
     ):
         """Top-k routing with a route plan for moe_gemm_layer.
 
-        logits [batch, E] bf16 -> weight [batch, topk (+1)] float32 (softmax
-        over the chosen logits; with shared_logit [batch, 1] one more slot,
-        sigmoid of it, routed to the extra expert E for every token),
-        route_list [E (+1), batch] int32, route_meta int32 (moe_plan_cap).
+        logits [batch, >= E (+1)] bf16 -> weight [batch, topk (+1)] float32
+        (softmax over the chosen of the first E logits; with shared one more
+        slot, the sigmoid of column E, routed to the extra expert E for every
+        token), route_list [E (+1), batch] int32, route_meta int32
+        (moe_plan_cap).
         """
         from .moe_pack import moe_plan_cap
         assert self.target_cc in (100, 103)
-        batch, e = logits.dim(0), logits.dim(1)
-        shared = 0 if shared_logit is None else 1
+        batch = logits.dim(0)
+        e = logits.dim(1) if num_experts is None else num_experts
+        shared = 1 if shared else 0
+        assert logits.dim(1) >= e + shared
         slots = weight.dim(1)
         cap = moe_plan_cap(batch, e + shared, slots, nt)
         assert weight.dim(0) == batch
         assert route_list.dim(0) == e + shared and route_list.dim(1) == batch
         assert route_meta.dim(0) == 1 + cap + e + shared
-        inputs = [logits] + ([shared_logit] if shared else [])
-        self.ext_layer("moe_route_sm100", inputs,
+        self.ext_layer("moe_route_sm100", [logits],
                        [weight, route_list, route_meta], (1, 1, 1),
-                       [batch, e, slots - shared, nt, shared, cap])
+                       [batch, e, slots - shared, nt, shared, cap,
+                        logits.dim(1)])
 
     def moe_gemm_layer(
         self,
@@ -2409,6 +2414,7 @@ class PersistentKernel:
         act: tuple = None,
         bias: DTensor = None,
         num_tasks: int = None,
+        trace: DTensor = None,
     ):
         """One wave of an expert GEMM over a route plan.
 
@@ -2428,9 +2434,13 @@ class PersistentKernel:
         e_tot, slots = route_list.dim(0), output.dim(1)
         cap = moe_plan_cap(batch, e_tot, slots, nt)
         rb = (rows + 127) // 128
-        kb = k // weight.dim(2) if mxfp4 else 64
+        if mxfp4:
+            kb = k // weight.dim(2)
+        else:
+            # columns of one weight copy: whole 64-column tiles
+            kb = 128 if k % 128 == 0 else 64
         assert weight.dim(0) == e_tot and weight.dim(1) == rb
-        assert weight.dim(2) * kb == k
+        assert weight.dim(2) * (kb if mxfp4 else 64) == k
         assert output.dim(0) == batch
         assert output.dim(2) == (rows // 2 if act is not None else rows)
         assert route_meta.dim(0) == 1 + cap + e_tot
@@ -2442,6 +2452,9 @@ class PersistentKernel:
         if bias is not None:
             assert bias.dim(0) == e_tot and bias.dim(1) == rows
             inputs.append(bias)
+        if trace is not None:
+            # int64 [workers, 64] time stamps; needs -DMXG_TRACE (tuning aid)
+            inputs.append(trace)
         self.ext_layer(
             "moe_gemm_sm100", inputs, [output], (g, 1, 1),
             [1 if mxfp4 else 0, 0 if act is None else 1,
