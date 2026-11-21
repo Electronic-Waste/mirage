@@ -1026,4 +1026,77 @@ __device__ __forceinline__ void
 #endif
 }
 
+// ---------------------------------------------------------------------------
+// The experts' outputs back into the residual stream:
+//   y = residual + sum_s w[s] * out[s]
+// with the reference models' roundings: every product is a bf16 number, their
+// sum is, and so is the sum with the residual; with SHARED the last slot (the
+// shared expert) is added to the rounded sum of the routed ones.
+// inputs: [0] out bf16 [BATCH][SLOTS][H]; [1] w fp32 [BATCH][SLOTS];
+// [2] residual bf16 [BATCH][H]. outputs: [0] y bf16 [BATCH][H].
+// A warp per token; lane l holds the 16-byte chunks l, l + 32, ...
+// ---------------------------------------------------------------------------
+template <int BATCH, int SLOTS, int H, int G, int SHARED, class TD, class RC>
+__device__ __forceinline__ void
+    moe_combine_sm100(TD const *task_desc, RC const &runtime_config) {
+  using namespace mxg;
+  constexpr int NCHUNK = H / 8;
+  constexpr int ROUTED = SLOTS - SHARED;
+  static_assert(H % 8 == 0 && SLOTS <= 16, "16 B chunks, the slots in registers");
+  const uint4 *in = static_cast<const uint4 *>(task_desc->input_ptrs[0]);
+  const float *wt = static_cast<const float *>(task_desc->input_ptrs[1]);
+  const uint4 *res = static_cast<const uint4 *>(task_desc->input_ptrs[2]);
+  uint4 *y = static_cast<uint4 *>(task_desc->output_ptrs[0]);
+  const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+  const int nwarps = blockDim.x >> 5;
+  const int gw = static_cast<int>(task_desc->task_metadata.ext_bid_x) * nwarps +
+                 warp;
+#pragma unroll 1
+  for (int t = gw; t < BATCH; t += G * nwarps) {
+    float w[SLOTS];
+#pragma unroll
+    for (int s = 0; s < SLOTS; ++s) {
+      w[s] = wt[static_cast<size_t>(t) * SLOTS + s];
+    }
+    const uint4 *ir = in + static_cast<size_t>(t) * SLOTS * NCHUNK;
+#pragma unroll 1
+    for (int c = lane; c < NCHUNK; c += 32) {
+      float acc[8] = {0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
+      float sh[8] = {0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
+#pragma unroll
+      for (int s = 0; s < SLOTS; ++s) {
+        const uint4 v = ir[s * NCHUNK + c];
+        const unsigned *p = reinterpret_cast<const unsigned *>(&v);
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+          const float lo = bfround(bf2f(p[j] & 0xffff) * w[s]);
+          const float hi = bfround(bf2f(p[j] >> 16) * w[s]);
+          if (s < ROUTED) {
+            acc[2 * j] += lo;
+            acc[2 * j + 1] += hi;
+          } else {
+            sh[2 * j] = lo;
+            sh[2 * j + 1] = hi;
+          }
+        }
+      }
+      const uint4 rv = res[static_cast<size_t>(t) * NCHUNK + c];
+      const unsigned *q = reinterpret_cast<const unsigned *>(&rv);
+      uint4 o;
+      unsigned *r = reinterpret_cast<unsigned *>(&o);
+#pragma unroll
+      for (int j = 0; j < 4; ++j) {
+        float lo = bfround(acc[2 * j]), hi = bfround(acc[2 * j + 1]);
+        if (SHARED) {
+          lo = bfround(lo + sh[2 * j]);
+          hi = bfround(hi + sh[2 * j + 1]);
+        }
+        r[j] = static_cast<unsigned>(f2bf(bf2f(q[j] & 0xffff) + lo)) |
+               (static_cast<unsigned>(f2bf(bf2f(q[j] >> 16) + hi)) << 16);
+      }
+      y[static_cast<size_t>(t) * NCHUNK + c] = o;
+    }
+  }
+}
+
 } // namespace kernel

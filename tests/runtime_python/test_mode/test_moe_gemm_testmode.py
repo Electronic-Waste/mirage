@@ -113,9 +113,17 @@ def main():
         bias=pk.attach_input(b13, name="b13") if mx else None)
     pk.moe_gemm_layer(
         input=d_act, weight=pk.attach_input(w2p, name="w2"), route_list=d_l,
-        route_meta=d_m, output=pk.attach_input(out, name="out"), nt=nt,
+        route_meta=d_m, output=(d_out := pk.attach_input(out, name="out")),
+        nt=nt,
         mxfp4=mx, rows=H,
         bias=pk.attach_input(b2, name="b2") if mx else None)
+
+    residual = (torch.randn(B, H, device=dev) * 0.5).to(bf)
+    comb = torch.zeros(B, H, dtype=bf, device=dev)
+    pk.moe_combine_layer(
+        input=d_out, weight=d_w,
+        residual=pk.attach_input(residual, name="residual"),
+        output=pk.attach_input(comb, name="comb"), shared=bool(shared))
 
     print("Compiling test kernel...")
     pk.compile(output_dir=os.path.dirname(os.path.abspath(__file__)))
@@ -144,6 +152,14 @@ def main():
     act_ref = bfr((u + off) * g * torch.sigmoid(alpha * g))
     o = bfr(torch.einsum("bsk,bsrk->bsr", act_ref, w2f[sel]))
     out_ref = bfr(o + b2.float()[sel]) if mx else o
+
+    # the combine, from the kernel's own W2 output: bf16 products, their
+    # bf16 sum (+ the shared expert's product), + the residual
+    prod = bfr(out.float() * w_ref[..., None])
+    csum = bfr(prod[:, :TOPK].sum(1))
+    if shared:
+        csum = bfr(csum + prod[:, TOPK])
+    comb_ref = bfr(residual.float() + csum)
 
     ok = True
 
@@ -183,6 +199,7 @@ def main():
     check("route weight", weight, w_ref, 1e-6)
     check("w13 + activation", act, act_ref, 0.02)
     check("w2", out, out_ref, 0.02)
+    check("combine", comb, comb_ref, 0.02)
 
     pk.finalize()
     if not ok:

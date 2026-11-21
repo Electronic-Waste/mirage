@@ -2461,6 +2461,31 @@ class PersistentKernel:
              0 if bias is None else 1, 1 if slotted else 0,
              batch, e_tot, slots, nt, k, rows, kb, g, cap] + bits)
 
+    def moe_combine_layer(
+        self,
+        input: DTensor,
+        weight: DTensor,
+        residual: DTensor,
+        output: DTensor,
+        shared: bool = False,
+        num_tasks: int = None,
+    ):
+        """output = residual + sum over slots of weight * input.
+
+        input [batch, slots, H] bf16 (moe_gemm_layer's W2 output), weight
+        [batch, slots] float32 (moe_route_layer's), residual and output
+        [batch, H] bf16. With shared the last slot is the shared expert's.
+        One task covers 8 tokens: a wave is ceil(batch / 8) tasks at most.
+        """
+        assert self.target_cc in (100, 103)
+        batch, slots, h = input.dim(0), input.dim(1), input.dim(2)
+        g = min(self.num_workers, (batch + 7) // 8)
+        if num_tasks is not None:
+            g = num_tasks
+        self.ext_layer("moe_combine_sm100", [input, weight, residual],
+                       [output], (g, 1, 1),
+                       [batch, slots, h, g, 1 if shared else 0])
+
     def moe_mul_sum_add_layer(
         self,
         input: DTensor,

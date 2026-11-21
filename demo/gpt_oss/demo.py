@@ -168,11 +168,25 @@ if __name__ == "__main__":
             while time.perf_counter() < bench_warm_end:
                 (bench_warm @ bench_warm).sum().item()
             del bench_warm
+        # Benchmark hook: MPK_BENCH_WATCH=<seconds> polls the requests'
+        # positions during the launch and gives up, with a report of what the
+        # workers last did, when they stop moving for that long.
+        bench_watch = float(os.environ.get("MPK_BENCH_WATCH", "0"))
+        if bench_watch > 0:
+            from mirage.mpk.bench_watch import LaunchWatch
+            watch = LaunchWatch(meta_tensors["step"], profiler_tensor,
+                                num_workers)
         torch.cuda.synchronize()
         bench_t0, bench_c0 = time.time(), time.perf_counter()
         starter.record()
-        mpk()
-        ender.record()
+        if bench_watch > 0:
+            mpk.launch_func(int(torch.cuda.current_stream().cuda_stream))
+            ender.record()
+            if not watch.wait(ender, bench_watch):
+                os._exit(3)
+        else:
+            mpk()
+            ender.record()
         torch.cuda.synchronize()
         bench_wall_ms = (time.perf_counter() - bench_c0) * 1e3
         run_time = starter.elapsed_time(ender)

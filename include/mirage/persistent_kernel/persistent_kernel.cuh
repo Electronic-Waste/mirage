@@ -1884,6 +1884,14 @@ extern "C" void
              all_events.data(),
              all_events.size() * sizeof(EventDesc),
              cudaMemcpyHostToDevice);
+  // Every task of an iteration is queued when the iteration begins (task k
+  // on worker k % num_workers), so a worker's queue must hold its whole share
+  // of the task graph: a shorter ring drops tasks that have not run yet and
+  // the iteration never ends.
+  while (global_runtime_config.per_worker_queue_len <
+         all_tasks.size() / num_workers + 64) {
+    global_runtime_config.per_worker_queue_len *= 2;
+  }
   // Initialize worker queues
   {
     std::vector<TaskId *> host_worker_queues;

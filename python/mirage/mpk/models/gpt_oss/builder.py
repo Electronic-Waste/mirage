@@ -442,10 +442,15 @@ class GptOssBuilder(GraphBuilder):
                     moe_routing_indices=self.routing_indices, moe_mask=self.moe_mask,
                     output=self.mlp_out,
                     grid_dim=(8, _grid_x(h, 64), 1), block_dim=(256, 1, 1))
-            self.mpk.moe_mul_sum_add_layer(
-                input=self.mlp_out, weight=self.topk_weight, residual=self.x,
-                output=self.mlp_sum_out,
-                grid_dim=(mbt, _grid_x(h, 64), 1), block_dim=(256, 1, 1))
+            if self.moe == "plan":
+                self.mpk.moe_combine_layer(
+                    input=self.mlp_out, weight=self.topk_weight,
+                    residual=self.x, output=self.mlp_sum_out)
+            else:
+                self.mpk.moe_mul_sum_add_layer(
+                    input=self.mlp_out, weight=self.topk_weight,
+                    residual=self.x, output=self.mlp_sum_out,
+                    grid_dim=(mbt, _grid_x(h, 64), 1), block_dim=(256, 1, 1))
             self.x = self.mlp_sum_out
 
     def encode(self, text: str):
