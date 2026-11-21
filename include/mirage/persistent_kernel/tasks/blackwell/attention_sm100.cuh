@@ -225,7 +225,11 @@ __device__ __forceinline__ void multitoken_paged_attention_sm100_task_impl(
     // total smem independent of MAX_TOKENS * NUM_QO_PER_KV so GQA ratios
     // >= 8:1 (e.g. Qwen3-32B, 64 Q / 8 KV heads) fit the Blackwell smem
     // budget (issue #702).
-    constexpr size_t S_O_BUFFER_SIZE = sizeof(float) * NUM_THREADS * 64;
+    // A thread's fragments of one m-tile: 8 floats per 16 columns. (This was
+    // a literal 64, right for HEAD_DIM 128 only: at 256 the threads' slots
+    // overlapped and the first half of every head's output was overwritten.)
+    constexpr int O_FRAGS = HEAD_DIM / 2;
+    constexpr size_t S_O_BUFFER_SIZE = sizeof(float) * NUM_THREADS * O_FRAGS;
     constexpr size_t S_TOTAL_OFFSET = S_O_BUFFER_OFFSET + S_O_BUFFER_SIZE;
     static_assert(S_TOTAL_OFFSET <=
                   mirage::runtime::MAX_DYNAMIC_SHARED_MEMORY_SIZE);
@@ -658,7 +662,8 @@ __device__ __forceinline__ void multitoken_paged_attention_sm100_task_impl(
       for (int n = 0; n < HEAD_DIM / 16; n++) {
 #pragma unroll
         for (int frag_idx = 0; frag_idx < 8; frag_idx++) {
-          s_o_buffer[threadIdx.x * 64 + n * 8 + frag_idx] = o[m][n][frag_idx];
+          s_o_buffer[threadIdx.x * O_FRAGS + n * 8 + frag_idx] =
+              o[m][n][frag_idx];
         }
       }
       wg_barrier.arrive_and_wait();
@@ -714,8 +719,8 @@ __device__ __forceinline__ void multitoken_paged_attention_sm100_task_impl(
                      other_d * expf(other_m - m_global);
           // accumulate o (buffer holds only the current m-tile)
           float other_o =
-              s_o_buffer[local_idx * 32 * 64 // 32 threads per local value
-                         + t_idx * 64        // corresponding thread
+              s_o_buffer[local_idx * 32 * O_FRAGS // 32 threads per local value
+                         + t_idx * O_FRAGS   // corresponding thread
                          + mma_iter_n * 8    // mma iter n
                          + frag_idx];
           o_global = o_global * expf(m_prev - m_global) +
