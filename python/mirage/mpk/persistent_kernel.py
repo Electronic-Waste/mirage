@@ -2486,6 +2486,83 @@ class PersistentKernel:
                        [output], (g, 1, 1),
                        [batch, slots, h, g, 1 if shared else 0])
 
+    # ---- Qwen3.5's tasks (tasks/blackwell/qwen35_sm100.cuh) ----
+    @staticmethod
+    def _float_bits(v: float) -> int:
+        import struct
+        return struct.unpack("<i", struct.pack("<f", v))[0]
+
+    def _token_tasks(self, batch: int, num_tasks: int = None) -> int:
+        """Tasks of a wave whose warps take one token each."""
+        if num_tasks is not None:
+            return num_tasks
+        return min(self.num_workers, (batch + 7) // 8)
+
+    def norm1p_layer(self, input: DTensor, weight: DTensor, output: DTensor,
+                     eps: float = 1e-6, num_tasks: int = None):
+        """RMSNorm with the weight 1 + w, [batch, H] bf16 (fp32 inside)."""
+        batch, h = input.dim(0), input.dim(1)
+        g = self._token_tasks(batch, num_tasks)
+        self.ext_layer("norm1p_sm100", [input, weight], [output], (g, 1, 1),
+                       [batch, h, g, self._float_bits(eps)])
+
+    def qsa_prep_layer(self, proj: DTensor, q_norm: DTensor, k_norm: DTensor,
+                       output: DTensor, num_kv_heads: int, q_per_kv: int,
+                       head_dim: int, eps: float = 1e-6, num_tasks: int = None):
+        """Full attention's q / k norm (weight 1 + w) into the packed
+        q / k / v layout of paged_attention_layer; proj [batch, >= that]."""
+        batch = proj.dim(0)
+        heads = num_kv_heads * (q_per_kv + 2)
+        assert output.dim(1) == heads * head_dim and proj.dim(1) >= output.dim(1)
+        g = min(self.num_workers, (batch * heads + 7) // 8)
+        if num_tasks is not None:
+            g = num_tasks
+        self.ext_layer("qsa_prep_sm100", [proj, q_norm, k_norm], [output],
+                       (g, 1, 1),
+                       [batch, proj.dim(1), num_kv_heads, q_per_kv, head_dim,
+                        g, self._float_bits(eps)])
+
+    def gate_mul_layer(self, input: DTensor, proj: DTensor, gate_offset: int,
+                       output: DTensor, num_tasks: int = None):
+        """output = input * sigmoid(proj[:, gate_offset:]), [batch, W] bf16."""
+        batch, w = input.dim(0), input.dim(1)
+        assert proj.dim(1) >= gate_offset + w
+        g = self._token_tasks(batch, num_tasks)
+        self.ext_layer("gate_mul_sm100", [input, proj], [output], (g, 1, 1),
+                       [batch, w, proj.dim(1), gate_offset, g])
+
+    def gdn_step_layer(self, proj: DTensor, conv_weight: DTensor,
+                       conv_state: DTensor, state: DTensor, params: DTensor,
+                       output: DTensor, num_key_heads: int, head_dim: int,
+                       eps: float = 1e-6, request_map: DTensor = None,
+                       num_tasks: int = None, after: DTensor = None):
+        """One decode step of a gated delta net layer (one token a request).
+
+        proj [batch, >= q | k | v | z | b | a] bf16, conv_weight [channels, 4]
+        bf16, conv_state [requests, 3, channels] bf16, state [requests,
+        2 * key heads, D, D] float32, params float32 [-exp(A_log), dt_bias,
+        norm weight], output [batch, 2 * key heads * D] bf16. request_map
+        int32 [batch, 2] = (request, position) replaces the runtime's (tests);
+        `after` is a tensor the layer only waits for (two layers that share
+        states and nothing else have no order otherwise).
+        """
+        batch = proj.dim(0)
+        nreq = state.dim(0)
+        g = min(self.num_workers, batch * num_key_heads)
+        if num_tasks is not None:
+            g = num_tasks
+        inputs = [proj, conv_weight, conv_state, state, params]
+        if request_map is not None:
+            inputs.append(request_map)
+        if after is not None:
+            if request_map is None:
+                inputs.append(after)  # (slot 5 is the request map's)
+            inputs.append(after)
+        self.ext_layer("gdn_step_sm100", inputs, [output], (g, 1, 1),
+                       [batch, nreq, num_key_heads, head_dim, proj.dim(1), g,
+                        self._float_bits(eps),
+                        0 if request_map is None else 1])
+
     def moe_mul_sum_add_layer(
         self,
         input: DTensor,

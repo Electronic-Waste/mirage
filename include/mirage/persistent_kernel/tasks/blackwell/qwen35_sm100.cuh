@@ -242,7 +242,8 @@ __device__ __forceinline__ void
 // outputs: [0] bf16 [BATCH][2 NKH D], the layer's input to out_proj.
 // Unit = (token, key head): the head's q and k, its two value heads and their
 // states (two value heads share a key head). The request and its position come
-// from the runtime (request_ids, step): position 0 starts from zero states.
+// from the runtime (request_ids, step) or, with XMAP (tests), from input [5],
+// int32 [BATCH][2]: position 0 starts from zero states.
 // Per value head (the reference's torch_recurrent_gated_delta_rule):
 //   S <- S exp(g); kv = S^T k; delta = (v - kv) beta; S <- S + k delta^T;
 //   o = S^T q, with k, q L2-normalized and q scaled by 1 / sqrt(D).
@@ -256,6 +257,7 @@ template <int BATCH,
           int PW,
           int G,
           int EPS_BITS,
+          int XMAP,
           class TD,
           class RC>
 __device__ __forceinline__ void
@@ -299,11 +301,20 @@ __device__ __forceinline__ void
 #pragma unroll 1
   for (int u = task_i; u < BATCH * NKH; u += G) {
     const int t = u / NKH, hk = u % NKH;
-    const int rid = runtime_config.request_ids[t];
+    int rid, pos = 0;
+    if (XMAP) {
+      const int *xm = static_cast<const int *>(task_desc->input_ptrs[5]);
+      rid = xm[2 * t];
+      pos = xm[2 * t + 1];
+    } else {
+      rid = runtime_config.request_ids[t];
+      if (rid >= 0) {
+        pos = runtime_config.step[rid];
+      }
+    }
     if (rid < 0) {
       continue; // an empty request slot (uniform over the block)
     }
-    const int pos = runtime_config.step[rid];
     const bool fresh = pos == 0;
     const unsigned short *pr = proj + static_cast<size_t>(t) * PW;
     unsigned short *cs = cstate + static_cast<size_t>(rid) * 3 * C;
