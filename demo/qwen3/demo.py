@@ -4,7 +4,7 @@ from safetensors.torch import load_model
 import torch
 import torch.distributed as dist
 import argparse
-import os, json
+import os, json, time
 
 from models.qwen3_shard_loader import Qwen3ShardLoader
 from mirage.mpk.base_dynamic_shard_loader import ShardType
@@ -284,6 +284,17 @@ if __name__ == "__main__":
         for i in range(model_inputs.input_ids.shape[-1]):
             tokens[r, i] = model_inputs.input_ids[0, i]
     prompt_lengths = torch.full((total_num_requests,), model_inputs.input_ids.shape[-1], dtype=torch.int, device="cuda")
+    # Benchmark hook: MPK_BENCH_PROMPT_IDS names a raw int32 file of
+    # [requests, prompt_len] token ids. Every request then gets its own raw
+    # prompt instead of the one chat-templated prompt (~39 tokens) above.
+    bench_prompt_ids = os.environ.get("MPK_BENCH_PROMPT_IDS")
+    if bench_prompt_ids:
+        import numpy as np
+        bench_ids = np.fromfile(bench_prompt_ids, dtype=np.int32).reshape(total_num_requests, -1)
+        assert 0 < bench_ids.shape[1] < args.max_seq_length
+        tokens.zero_()
+        tokens[:, :bench_ids.shape[1]] = torch.from_numpy(bench_ids.astype(np.int64)).to(tokens.device)
+        prompt_lengths.fill_(bench_ids.shape[1])
     positions = torch.arange(32768).unsqueeze(0).to(model.device)
     position_embeddings = model.model.rotary_emb(positions)
 
@@ -945,11 +956,36 @@ if __name__ == "__main__":
             print(f"Saved tokens to {save_path}")
 
     else:
+        # Benchmark hook: MPK_BENCH_WARMUP_MS of unrelated GPU work right before
+        # the launch, so the launch does not start on an idle GPU's clocks.
+        bench_warm_ms = float(os.environ.get("MPK_BENCH_WARMUP_MS", "0"))
+        if bench_warm_ms > 0:
+            bench_warm_end = time.perf_counter() + bench_warm_ms / 1e3
+            bench_warm = torch.randn(4096, 4096, device="cuda", dtype=torch.float32)
+            while time.perf_counter() < bench_warm_end:
+                (bench_warm @ bench_warm).sum().item()
+            del bench_warm
+        torch.cuda.synchronize()
+        bench_t0, bench_c0 = time.time(), time.perf_counter()
         starter.record()
         mpk()
         ender.record()
         torch.cuda.synchronize()
+        bench_wall_ms = (time.perf_counter() - bench_c0) * 1e3
         run_time = starter.elapsed_time(ender)
+        if bench_prompt_ids:
+            # Benchmark hook: host wall clock of the one launch that holds the
+            # whole generation, and optionally the tokens it wrote.
+            if os.environ.get("MPK_BENCH_TOKENS_OUT"):
+                tokens.cpu().numpy().astype("int32").tofile(os.environ["MPK_BENCH_TOKENS_OUT"])
+            print("MPK_BENCH " + json.dumps({
+                "wall_ms": bench_wall_ms, "event_ms": run_time,
+                "t0": bench_t0, "t1": bench_t0 + bench_wall_ms / 1e3,
+                "requests": total_num_requests,
+                "prompt_len": int(prompt_lengths[0].item()),
+                "seq_len": int(tokens.shape[1]),
+                "step_min": int(step.min().item()), "step_max": int(step.max().item()),
+            }))
 
         print("tokens.shape = ", tokens.shape)
         for r in range(total_num_requests):

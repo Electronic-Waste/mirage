@@ -7,7 +7,9 @@ TODO: native MXFP4 support.
 """
 
 import argparse
+import json
 import os
+import time
 
 import torch
 from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
@@ -61,6 +63,18 @@ if __name__ == "__main__":
             [{"role": "user", "content": args.prompt}],
             tokenize=False, add_generation_prompt=True)
     input_ids = tokenizer([text], return_tensors="pt").input_ids[0]
+    # Benchmark hook: MPK_BENCH_PROMPT_IDS names a raw int32 file of
+    # [requests, prompt_len] token ids. The megakernel then serves
+    # --max-num-batched-requests requests, each with its own raw prompt,
+    # instead of the single prompt above.
+    bench_prompt_ids = os.environ.get("MPK_BENCH_PROMPT_IDS")
+    bench_ids = None
+    if bench_prompt_ids:
+        import numpy as np
+        bench_ids = torch.from_numpy(
+            np.fromfile(bench_prompt_ids, dtype=np.int32)
+            .reshape(args.max_num_batched_requests, -1).astype(np.int64))
+        input_ids = bench_ids[0]
     prompt_len = input_ids.shape[-1]
     assert prompt_len < args.max_seq_length
     output_len = (args.max_new_tokens if args.max_new_tokens is not None
@@ -73,8 +87,13 @@ if __name__ == "__main__":
         # The megakernel stops at max_seq_length, so shorten it to make
         # --max-new-tokens the binding limit.
         seq_len = min(args.max_seq_length, prompt_len + output_len)
-        tokens = torch.zeros(1, seq_len, dtype=torch.long, device="cuda")
-        tokens[0, :prompt_len] = input_ids.to("cuda")
+        if bench_ids is not None:
+            tokens = torch.zeros(bench_ids.shape[0], seq_len, dtype=torch.long,
+                                 device="cuda")
+            tokens[:, :prompt_len] = bench_ids.to("cuda")
+        else:
+            tokens = torch.zeros(1, seq_len, dtype=torch.long, device="cuda")
+            tokens[0, :prompt_len] = input_ids.to("cuda")
         mbt = args.max_num_batched_tokens
         n_req = tokens.shape[0]
         # KV 2.0: the plan is the source of truth for the cache layout
@@ -104,6 +123,15 @@ if __name__ == "__main__":
         }
 
         num_workers, num_schedulers = mi.get_configurations_from_gpu(0)
+        # Benchmark hook: MPK_BENCH_PROFILE names a .npy file that receives the
+        # raw profiler buffer (the built-in exporters are too slow for a whole
+        # generation).
+        bench_profile = os.environ.get("MPK_BENCH_PROFILE")
+        profiler_tensor = None
+        if bench_profile:
+            profiler_tensor = torch.zeros(
+                int(os.environ.get("MPK_BENCH_PROFILE_ENTRIES", str(1 << 24))),
+                dtype=torch.uint64, device="cuda")
         mpk = mi.PersistentKernel(
             mode="offline", world_size=1, mpi_rank=0,
             num_workers=num_workers, num_local_schedulers=num_schedulers,
@@ -114,7 +142,7 @@ if __name__ == "__main__":
             max_num_pages=max_num_pages,
             kv_groups=kv_plan.group_specs(),
             eos_token_id=-1 if args.ignore_eos else 200002,
-            meta_tensors=meta_tensors, profiler_tensor=None, trace_name="",
+            meta_tensors=meta_tensors, profiler_tensor=profiler_tensor, trace_name="",
             spec_decode_config=None, use_cutlass_kernel=False,
         )
 
@@ -123,12 +151,42 @@ if __name__ == "__main__":
             model_name=args.model, model_path=args.model)
         print("Compiling the megakernel...")
         mpk.compile(output_dir=args.output_dir)
+        if bench_profile:
+            mpk.profiler_tensor = None
 
+        # Benchmark hook: MPK_BENCH_WARMUP_MS of unrelated GPU work right before
+        # the launch, so the launch does not start on an idle GPU's clocks.
+        bench_warm_ms = float(os.environ.get("MPK_BENCH_WARMUP_MS", "0"))
+        if bench_warm_ms > 0:
+            bench_warm_end = time.perf_counter() + bench_warm_ms / 1e3
+            bench_warm = torch.randn(4096, 4096, device="cuda", dtype=torch.float32)
+            while time.perf_counter() < bench_warm_end:
+                (bench_warm @ bench_warm).sum().item()
+            del bench_warm
+        torch.cuda.synchronize()
+        bench_t0, bench_c0 = time.time(), time.perf_counter()
         starter.record()
         mpk()
         ender.record()
         torch.cuda.synchronize()
+        bench_wall_ms = (time.perf_counter() - bench_c0) * 1e3
         run_time = starter.elapsed_time(ender)
+        if bench_profile:
+            import numpy as np
+            np.save(bench_profile, profiler_tensor.cpu().numpy())
+        if bench_prompt_ids:
+            # Benchmark hook: host wall clock of the one launch that holds the
+            # whole generation, and optionally the tokens it wrote.
+            if os.environ.get("MPK_BENCH_TOKENS_OUT"):
+                tokens.cpu().numpy().astype("int32").tofile(os.environ["MPK_BENCH_TOKENS_OUT"])
+            print("MPK_BENCH " + json.dumps({
+                "wall_ms": bench_wall_ms, "event_ms": run_time,
+                "t0": bench_t0, "t1": bench_t0 + bench_wall_ms / 1e3,
+                "requests": n_req, "prompt_len": int(prompt_len),
+                "seq_len": int(seq_len),
+                "step_min": int(meta_tensors["step"].min().item()),
+                "step_max": int(meta_tensors["step"].max().item()),
+            }))
 
         end_idx = min(meta_tensors["step"][0].item() + 1,
                       prompt_len + output_len)
