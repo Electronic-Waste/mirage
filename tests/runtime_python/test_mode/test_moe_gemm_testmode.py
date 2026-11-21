@@ -1,0 +1,192 @@
+"""Test-mode coverage for the routed-expert extension tasks
+(moe_route_layer + moe_gemm_layer): routing, W13 with the fused gated
+activation, W2, against PyTorch.
+
+    python tests/runtime_python/test_mode/test_moe_gemm_testmode.py \
+        [--batch 5] [--bf16] [--experts 32] [--topk 4] [--shared]
+
+--bf16 runs bf16 expert weights (SiLU(gate) * up, no bias, the Qwen3.5 form)
+instead of MXFP4 ones (clamped SwiGLU with biases, the GPT-OSS form);
+--shared adds a shared expert every token reaches through a sigmoid gate.
+"""
+
+import argparse
+import os
+import sys
+
+import torch
+
+import mirage
+from mirage.mpk.persistent_kernel import PersistentKernel
+from mirage.mpk import moe_pack
+
+
+def bfr(x):
+    return x.to(torch.bfloat16).float()
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--batch", type=int, default=5)
+    ap.add_argument("--bf16", action="store_true")
+    ap.add_argument("--shared", action="store_true")
+    ap.add_argument("--experts", type=int, default=32)
+    ap.add_argument("--topk", type=int, default=4)
+    ap.add_argument("--hidden", type=int, default=384)
+    ap.add_argument("--inter", type=int, default=192)
+    ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--skew", type=float, default=0.0,
+                    help="bias the router towards the first experts")
+    a = ap.parse_args()
+
+    torch.manual_seed(a.seed)
+    dev, bf = "cuda", torch.bfloat16
+    B, E, TOPK, H, I = a.batch, a.experts, a.topk, a.hidden, a.inter
+    mx = not a.bf16
+    shared = 1 if a.shared else 0
+    E_TOT, SLOTS = E + shared, TOPK + shared
+    nt = moe_pack.moe_tokens_per_pass(B)
+    if mx:
+        limit, alpha, off = 7.0, 1.702, 1.0
+    else:
+        limit, alpha, off = float("inf"), 1.0, 0.0
+
+    num_workers, num_schedulers = mirage.get_configurations_from_gpu(0)
+    params = PersistentKernel.get_default_init_parameters()
+    params.update(test_mode=True, num_workers=num_workers,
+                  num_local_schedulers=num_schedulers,
+                  max_num_batched_tokens=B, max_num_batched_requests=1,
+                  max_num_pages=16, page_size=max(64, B))
+    pk = PersistentKernel(**params)
+
+    # ---- data
+    logits = (torch.randn(B, E, device=dev) -
+              a.skew * torch.arange(E, device=dev) / E).to(bf)
+    shared_logit = torch.randn(B, 1, device=dev).to(bf)
+    x = (torch.randn(B, H, device=dev) * 0.5).to(bf)
+    if mx:
+        blk13 = torch.randint(0, 256, (E_TOT, 2 * I, H // 32, 16),
+                              dtype=torch.uint8, device=dev)
+        sc13 = torch.randint(115, 123, (E_TOT, 2 * I, H // 32),
+                             dtype=torch.uint8, device=dev)
+        blk2 = torch.randint(0, 256, (E_TOT, H, I // 32, 16),
+                             dtype=torch.uint8, device=dev)
+        sc2 = torch.randint(115, 123, (E_TOT, H, I // 32),
+                            dtype=torch.uint8, device=dev)
+        w13f = moe_pack.unpack_mxfp4(blk13, sc13)   # rows: gate 0, up 0, ...
+        w2f = moe_pack.unpack_mxfp4(blk2, sc2)
+        w13p = moe_pack.pack_mxfp4(blk13, sc13)
+        w2p = moe_pack.pack_mxfp4(blk2, sc2)
+        b13 = (torch.randn(E_TOT, 2 * I, device=dev) * 0.2).to(bf)
+        b2 = (torch.randn(E_TOT, H, device=dev) * 0.2).to(bf)
+    else:
+        # gate rows first, as the HF checkpoints store them
+        w13 = (torch.randn(E_TOT, 2 * I, H, device=dev) * 0.05).to(bf)
+        w2 = (torch.randn(E_TOT, H, I, device=dev) * 0.05).to(bf)
+        w13i = moe_pack.interleave_gate_up(w13)
+        w13f, w2f = w13i.float(), w2.float()
+        w13p = moe_pack.pack_bf16_tiles(w13i)
+        w2p = moe_pack.pack_bf16_tiles(w2)
+        b13 = b2 = None
+
+    weight, rlist, rmeta = moe_pack.moe_plan_tensors(B, E_TOT, SLOTS, nt)
+    act = torch.zeros(B, SLOTS, I, dtype=bf, device=dev)
+    out = torch.zeros(B, SLOTS, H, dtype=bf, device=dev)
+
+    # ---- graph
+    d_w, d_l, d_m = (pk.attach_input(weight, name="route_weight"),
+                     pk.attach_input(rlist, name="route_list"),
+                     pk.attach_input(rmeta, name="route_meta"))
+    d_act = pk.attach_input(act, name="act")
+    pk.moe_route_layer(
+        logits=pk.attach_input(logits, name="logits"), weight=d_w,
+        route_list=d_l, route_meta=d_m, nt=nt,
+        shared_logit=(pk.attach_input(shared_logit, name="shared_logit")
+                      if shared else None))
+    pk.moe_gemm_layer(
+        input=pk.attach_input(x, name="x"),
+        weight=pk.attach_input(w13p, name="w13"), route_list=d_l,
+        route_meta=d_m, output=d_act, nt=nt, mxfp4=mx, rows=2 * I,
+        act=(limit, alpha, off),
+        bias=pk.attach_input(b13, name="b13") if mx else None)
+    pk.moe_gemm_layer(
+        input=d_act, weight=pk.attach_input(w2p, name="w2"), route_list=d_l,
+        route_meta=d_m, output=pk.attach_input(out, name="out"), nt=nt,
+        mxfp4=mx, rows=H,
+        bias=pk.attach_input(b2, name="b2") if mx else None)
+
+    print("Compiling test kernel...")
+    pk.compile(output_dir=os.path.dirname(os.path.abspath(__file__)))
+    print("Running test kernel...")
+    pk()
+    torch.cuda.synchronize()
+
+    # ---- reference
+    lf = logits.float()
+    # equal logits: the lower expert first (the kernel's rule)
+    order = torch.sort(lf, dim=1, descending=True, stable=True).indices
+    sel = order[:, :TOPK]
+    w_ref = bfr(torch.softmax(torch.gather(lf, 1, sel), dim=1))
+    if shared:
+        sel = torch.cat([sel, torch.full((B, 1), E, device=dev)], dim=1)
+        w_ref = torch.cat(
+            [w_ref, bfr(torch.sigmoid(shared_logit.float()))], dim=1)
+    xf = x.float()
+    y = torch.einsum("bk,bsrk->bsr", xf, w13f[sel])
+    y = bfr(y)
+    if mx:
+        y = bfr(y + b13.float()[sel])
+    gate, up = y[..., 0::2], y[..., 1::2]
+    g = gate.clamp(max=limit)
+    u = up.clamp(-limit, limit)
+    act_ref = bfr((u + off) * g * torch.sigmoid(alpha * g))
+    o = bfr(torch.einsum("bsk,bsrk->bsr", act_ref, w2f[sel]))
+    out_ref = bfr(o + b2.float()[sel]) if mx else o
+
+    ok = True
+
+    def check(name, got, ref, rel):
+        nonlocal ok
+        got = got.float()
+        err = (got - ref).abs()
+        tol = rel * ref.abs() + rel * ref.abs().mean()
+        bad = int((err > tol).sum())
+        exact = float((got == ref).float().mean())
+        print(f"[{name}] max |kernel - reference| = {err.max().item():.5f}, "
+              f"|ref| max {ref.abs().max().item():.3f}, exact {exact:.4f}, "
+              f"outside tolerance {bad} of {ref.numel()}")
+        if bad or not torch.isfinite(got).all():
+            ok = False
+            print(f"[{name}] FAILED")
+
+    # routing: the plan must hold every (token, slot) under its expert
+    n_ep = int(rmeta[0])
+    cap = moe_pack.moe_plan_cap(B, E_TOT, SLOTS, nt)
+    counts = rmeta[1 + cap:1 + cap + E_TOT]
+    want = torch.bincount(sel.flatten(), minlength=E_TOT)
+    plan_ok = bool((counts == want).all())
+    seen = torch.full((B, SLOTS), -1, dtype=torch.long, device=dev)
+    for e in range(E_TOT):
+        ent = rlist[e, :int(counts[e])].long()
+        seen[ent >> 8, ent & 0xff] = e
+    plan_ok = plan_ok and bool((seen == sel).all())
+    pairs = rmeta[1:1 + n_ep].long()
+    want_pairs = [(e << 16) | p for e in range(E_TOT)
+                  for p in range((int(want[e]) + nt - 1) // nt)]
+    plan_ok = plan_ok and pairs.tolist() == want_pairs
+    print(f"[route] plan {'ok' if plan_ok else 'WRONG'}: {n_ep} (expert, pass) "
+          f"pairs, {int((want > 0).sum())} experts active, most tokens on one "
+          f"expert {int(want.max())}, NT {nt}")
+    ok = ok and plan_ok
+    check("route weight", weight, w_ref, 1e-6)
+    check("w13 + activation", act, act_ref, 0.02)
+    check("w2", out, out_ref, 0.02)
+
+    pk.finalize()
+    if not ok:
+        sys.exit(1)
+    print("\nPASSED")
+
+
+if __name__ == "__main__":
+    main()

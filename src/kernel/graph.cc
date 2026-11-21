@@ -1149,8 +1149,20 @@ void Graph::register_task_for_op(KNOperator const *op,
     task_config[op] = std::make_tuple(4, 2, TASK_HC_POST_MIX_SM100, variant_id);
   }
 
-  else {
-    printf("Unsupported task name: %s\n", name);
+  else if (name.rfind("ext:", 0) == 0) {
+    // Header-only extension task:
+    // params = [num_inputs, num_outputs, slot, template args...]
+    assert(params.size() >= 3);
+    int slot = params[2];
+    assert(slot >= 0 && TASK_EXT_TASK_BEGIN + 1 + slot < TASK_EXT_TASK_END);
+    TaskType type = static_cast<TaskType>(TASK_EXT_TASK_BEGIN + 1 + slot);
+    int variant_id = task_register->register_ext_task(
+        type,
+        name.substr(4),
+        std::vector<int>(params.begin() + 3, params.end()));
+    task_config[op] = std::make_tuple(params[0], params[1], type, variant_id);
+  } else {
+    printf("Unsupported task name: %s\n", name.c_str());
     assert(false && "Unsupported task type");
   }
 }

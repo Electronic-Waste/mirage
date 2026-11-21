@@ -222,6 +222,13 @@ enum TaskType {
   TASK_GPT_OSS_TASK_BEGIN = 450, // begin placeholder, not a real task
   // Clamped-alpha SwiGLU: (clamp(up) + 1) * clamp(gate) * sigmoid(gate*alpha)
   TASK_CLAMPED_SWIGLU = 451,
+  // Header-only extension tasks. A layer registers "ext:<impl>" with the
+  // params [num_inputs, num_outputs, slot, template args...]; its task body is
+  // kernel::<impl><template args...>(task_desc) and its type is
+  // TASK_EXT_TASK_BEGIN + 1 + slot (one profiler id per slot). The grid
+  // position of the task is in task_metadata (ext_bid_x / y / z).
+  TASK_EXT_TASK_BEGIN = 460, // begin placeholder, not a real task
+  TASK_EXT_TASK_END = 492,   // end placeholder, not a real task
   TASK_GPT_OSS_TASK_END = 499, // end placeholder, not a real task
   // static megakernel tasks (include/mirage/static_megakernel/), SM100 / SM103;
   // they run only in the generated static-schedule layer
@@ -358,6 +365,12 @@ struct FullTaskDesc {
     };
     struct {
       int task_offset; // Used for nvshmem team mapping
+    };
+    struct {
+      // Grid position of an extension task (TASK_EXT_*)
+      uint32_t ext_bid_x;
+      uint16_t ext_bid_y;
+      uint16_t ext_bid_z;
     };
     unsigned long long raw_payload;
   } task_metadata;

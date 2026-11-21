@@ -383,6 +383,13 @@ def get_compile_command(
     
     if profiling:
         flags = flags + ["-DMPK_ENABLE_PROFILING"]
+        # The profiler ends every request after one iteration unless asked to
+        # trace the whole run (needs a profiler buffer sized for it).
+        if os.environ.get("MPK_PROFILE_FULL_RUN"):
+            flags = flags + ["-DMPK_PROFILE_FULL_RUN"]
+
+    # Extra nvcc flags for experiments, e.g. MPK_EXTRA_CFLAGS="-DFOO=1 -DBAR".
+    flags = flags + os.environ.get("MPK_EXTRA_CFLAGS", "").split()
 
     return common_cmd + specific_cmd + flags
 
@@ -409,6 +416,10 @@ def _page_stride_rows(*caches):
     assert len(set(rows)) == 1, (
         f"paged caches in one task disagree on page stride: {rows}")
     return rows[0]
+
+
+# impl name -> profiler slot of an extension task (TASK_EXT_TASK_BEGIN + 1 + slot)
+_EXT_TASK_SLOTS = {}
 
 
 class PersistentKernel:
@@ -2326,6 +2337,117 @@ class PersistentKernel:
         else:
             assert False
         
+    # ------------------------------------------------------------------
+    # Header-only extension tasks (include/mirage/persistent_kernel/tasks):
+    # the task body is kernel::<impl><targs...>(task_desc).
+    # ------------------------------------------------------------------
+    def ext_layer(
+        self,
+        impl: str,
+        inputs: list,
+        outputs: list,
+        grid_dim: tuple,
+        targs: list,
+        block_dim: tuple = (256, 1, 1),
+    ):
+        """Add a layer of grid_dim tasks that run kernel::<impl><targs>.
+
+        No tensor is partitioned over the grid: every task sees the whole
+        tensors (task_desc->input_ptrs / output_ptrs in the given order) and
+        its grid position in task_desc->task_metadata.ext_bid_{x,y,z}.
+        """
+        inputs, outputs = list(inputs), list(outputs)
+        tb_graph = TBGraph(CyTBGraph(grid_dim, block_dim, 1, 64))
+        for t in inputs + outputs:
+            tb_graph.new_input(t, (-1, -1, -1), -1, True)
+        self.kn_graph.customized(inputs + outputs, tb_graph)
+        slot = _EXT_TASK_SLOTS.setdefault(impl, len(_EXT_TASK_SLOTS))
+        self.kn_graph.register_task(
+            tb_graph, "ext:" + impl,
+            [len(inputs), len(outputs), slot] + [int(a) for a in targs])
+
+    def moe_route_layer(
+        self,
+        logits: DTensor,
+        weight: DTensor,
+        route_list: DTensor,
+        route_meta: DTensor,
+        nt: int,
+        shared_logit: DTensor = None,
+    ):
+        """Top-k routing with a route plan for moe_gemm_layer.
+
+        logits [batch, E] bf16 -> weight [batch, topk (+1)] float32 (softmax
+        over the chosen logits; with shared_logit [batch, 1] one more slot,
+        sigmoid of it, routed to the extra expert E for every token),
+        route_list [E (+1), batch] int32, route_meta int32 (moe_plan_cap).
+        """
+        from .moe_pack import moe_plan_cap
+        assert self.target_cc in (100, 103)
+        batch, e = logits.dim(0), logits.dim(1)
+        shared = 0 if shared_logit is None else 1
+        slots = weight.dim(1)
+        cap = moe_plan_cap(batch, e + shared, slots, nt)
+        assert weight.dim(0) == batch
+        assert route_list.dim(0) == e + shared and route_list.dim(1) == batch
+        assert route_meta.dim(0) == 1 + cap + e + shared
+        inputs = [logits] + ([shared_logit] if shared else [])
+        self.ext_layer("moe_route_sm100", inputs,
+                       [weight, route_list, route_meta], (1, 1, 1),
+                       [batch, e, slots - shared, nt, shared, cap])
+
+    def moe_gemm_layer(
+        self,
+        input: DTensor,
+        weight: DTensor,
+        route_list: DTensor,
+        route_meta: DTensor,
+        output: DTensor,
+        nt: int,
+        mxfp4: bool,
+        rows: int,
+        act: tuple = None,
+        bias: DTensor = None,
+        num_tasks: int = None,
+    ):
+        """One wave of an expert GEMM over a route plan.
+
+        input [batch, K] or [batch, slots, K] bf16; weight packed by
+        moe_pack.pack_mxfp4 / pack_bf16_tiles, [E, row blocks, copies, bytes];
+        output [batch, slots, rows] bf16 or, with act = (limit, alpha, offset),
+        [batch, slots, rows / 2]: the rows are (gate, up) pairs and the output
+        (clamp(up, +-limit) + offset) * g * sigmoid(alpha * g), g = min(gate,
+        limit). bias [E, rows] bf16 is added before the activation.
+        """
+        import struct
+        from .moe_pack import moe_plan_cap
+        assert self.target_cc in (100, 103)
+        g = self.num_workers if num_tasks is None else num_tasks
+        slotted = input.num_dims == 3
+        batch, k = input.dim(0), input.dim(input.num_dims - 1)
+        e_tot, slots = route_list.dim(0), output.dim(1)
+        cap = moe_plan_cap(batch, e_tot, slots, nt)
+        rb = (rows + 127) // 128
+        kb = k // weight.dim(2) if mxfp4 else 64
+        assert weight.dim(0) == e_tot and weight.dim(1) == rb
+        assert weight.dim(2) * kb == k
+        assert output.dim(0) == batch
+        assert output.dim(2) == (rows // 2 if act is not None else rows)
+        assert route_meta.dim(0) == 1 + cap + e_tot
+        assert (cap * rb + g - 1) // g <= 64, "too many units per task"
+        limit, alpha, off = act if act is not None else (0.0, 0.0, 0.0)
+        bits = [struct.unpack("<i", struct.pack("<f", v))[0]
+                for v in (limit, alpha, off)]
+        inputs = [input, weight, route_list, route_meta]
+        if bias is not None:
+            assert bias.dim(0) == e_tot and bias.dim(1) == rows
+            inputs.append(bias)
+        self.ext_layer(
+            "moe_gemm_sm100", inputs, [output], (g, 1, 1),
+            [1 if mxfp4 else 0, 0 if act is None else 1,
+             0 if bias is None else 1, 1 if slotted else 0,
+             batch, e_tot, slots, nt, k, rows, kb, g, cap] + bits)
+
     def moe_mul_sum_add_layer(
         self,
         input: DTensor,

@@ -348,6 +348,13 @@ void register_mugraph(
                 task_type == TASK_SAMPLING_PARTIAL_SM100) {
               task.task_metadata.task_offset = bid.x;
             }
+            // Extension tasks read their grid position
+            if (task_type > TASK_EXT_TASK_BEGIN &&
+                task_type < TASK_EXT_TASK_END) {
+              task.task_metadata.ext_bid_x = bid.x;
+              task.task_metadata.ext_bid_y = bid.y;
+              task.task_metadata.ext_bid_z = bid.z;
+            }
             // Set expert_offset for MoE tasks
             if (task_type == TASK_MOE_W13_LINEAR_SM100 ||
                 task_type == TASK_MOE_W2_LINEAR_SM100 ||
@@ -1881,6 +1888,10 @@ TaskGraphResult print_task_graph(
       "TASK_NVSHMEM_ALLGATHER_STRIDED_PUT";
   task_type_to_name[TASK_NVSHMEM_TILE_ALLREDUCE] =
       "TASK_NVSHMEM_TILE_ALLREDUCE";
+
+  for (int t = TASK_EXT_TASK_BEGIN + 1; t < TASK_EXT_TASK_END; t++) {
+    task_type_to_name[static_cast<TaskType>(t)] = std::to_string(t);
+  }
 
   code.e("__device__ __forceinline__");
   code.e("void _execute_task(TaskDesc const* task_desc,");

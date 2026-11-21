@@ -329,7 +329,8 @@ __device__ __forceinline__ bool
       config.step[request_id] = step + num_tokens;
       int step_advance = num_tokens;
 #endif
-#if defined(MPK_ENABLE_PROFILING) || defined(MPK_TEST_MODE)
+#if (defined(MPK_ENABLE_PROFILING) && !defined(MPK_PROFILE_FULL_RUN)) ||       \
+    defined(MPK_TEST_MODE)
       if (true)
 #else
       if ((step + step_advance + 1 >= config.max_seq_length) ||

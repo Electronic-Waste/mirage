@@ -277,6 +277,10 @@ public:
   int register_nvshmem_tile_allreduce_task(threadblock::Graph const &bgraph,
                                            std::vector<int> const &params);
   // Multi-GPU tasks end
+  // Header-only extension task: kernel::<impl><targs...>(task_desc)
+  int register_ext_task(TaskType type,
+                        std::string const &impl,
+                        std::vector<int> const &targs);
   int register_task_variant(TaskType type, std::string const &code);
 
 public:

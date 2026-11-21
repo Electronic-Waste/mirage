@@ -46,6 +46,21 @@ int TaskRegister::register_task_variant(runtime::TaskType type,
   return (int)(variants.size() - 1);
 }
 
+int TaskRegister::register_ext_task(runtime::TaskType type,
+                                    std::string const &impl,
+                                    std::vector<int> const &targs) {
+  std::string call = "  kernel::" + impl;
+  if (!targs.empty()) {
+    call += "<";
+    for (size_t i = 0; i < targs.size(); i++) {
+      call += (i ? ", " : "") + std::to_string(targs[i]);
+    }
+    call += ">";
+  }
+  call += "(task_desc);\n";
+  return register_task_variant(type, call);
+}
+
 int TaskRegister::register_embedding_task(threadblock::Graph const &bgraph,
                                           std::vector<int> const &params) {
   assert(params.size() == 1);
