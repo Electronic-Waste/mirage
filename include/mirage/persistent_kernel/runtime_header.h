@@ -227,8 +227,8 @@ enum TaskType {
   // kernel::<impl><template args...>(task_desc, runtime_config) and its type is
   // TASK_EXT_TASK_BEGIN + 1 + slot (one profiler id per slot). The grid
   // position of the task is in task_metadata (ext_bid_x / y / z).
-  TASK_EXT_TASK_BEGIN = 460, // begin placeholder, not a real task
-  TASK_EXT_TASK_END = 492,   // end placeholder, not a real task
+  TASK_EXT_TASK_BEGIN = 460,   // begin placeholder, not a real task
+  TASK_EXT_TASK_END = 492,     // end placeholder, not a real task
   TASK_GPT_OSS_TASK_END = 499, // end placeholder, not a real task
   // static megakernel tasks (include/mirage/static_megakernel/), SM100 / SM103;
   // they run only in the generated static-schedule layer

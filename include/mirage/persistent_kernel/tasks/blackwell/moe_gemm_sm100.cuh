@@ -1,9 +1,15 @@
 // moe_gemm_sm100.cuh -- routed-expert GEMMs for SM100 as extension tasks.
 //
-//   moe_route_sm100   top-k routing of one layer: the softmax weights and a
-//                     route plan (per expert the tokens that reach it).
-//   moe_gemm_sm100    one worker's share of an expert GEMM wave (W13 with the
-//                     gated activation fused into the epilogue, or W2).
+//   moe_route_sm100     top-k routing of one layer: the softmax weights and
+//                       a route plan (per expert the tokens that reach it).
+//   moe_gemm_sm100      one worker's share of an expert GEMM wave (W13 with
+//                       the gated activation fused into the epilogue, or W2).
+//                       DENSE: an ordinary linear layer on the same machinery
+//                       (the builders' dense="gemm"; MPK's linear tasks are
+//                       the default for dense layers).
+//   moe_combine_sm100   the experts' outputs back into the residual stream.
+//   small_linear_sm100  a small linear layer without the tensor core and
+//   tmem_release_sm100  the end of an iteration's held TMEM (dense="gemm").
 //
 // The expert weights are stored in a layout made for streaming
 // (python/mirage/mpk/moe_pack.py):
@@ -37,7 +43,7 @@ namespace mxg {
 
 typedef unsigned long long u64;
 
-__device__ __forceinline__ unsigned sm_u32(const void *p) {
+__device__ __forceinline__ unsigned sm_u32(void const *p) {
   return static_cast<unsigned>(__cvta_generic_to_shared(p));
 }
 __device__ __forceinline__ float bf2f(unsigned short h) {
@@ -63,24 +69,12 @@ __device__ __forceinline__ void mbar_arrive(u64 *bar) {
                : "memory");
 }
 __device__ __forceinline__ void mbar_expect(u64 *bar, unsigned bytes) {
-  asm volatile(
-      "mbarrier.arrive.expect_tx.shared::cta.b64 _, [%0], %1;" ::"r"(
-          sm_u32(bar)),
-      "r"(bytes)
-      : "memory");
+  asm volatile("mbarrier.arrive.expect_tx.shared::cta.b64 _, [%0], %1;" ::"r"(
+                   sm_u32(bar)),
+               "r"(bytes)
+               : "memory");
 }
 __device__ __forceinline__ void mbar_wait(u64 *bar, unsigned phase) {
-#ifdef MXG_SPIN
-  asm volatile("{\n\t"
-               ".reg .pred p;\n\t"
-               "MXG_SPIN_WAIT:\n\t"
-               "mbarrier.test_wait.parity.shared::cta.b64 p, [%0], %1;\n\t"
-               "@!p bra MXG_SPIN_WAIT;\n\t"
-               "}" ::"r"(sm_u32(bar)),
-               "r"(phase)
-               : "memory");
-  return;
-#endif
   asm volatile("{\n\t"
                ".reg .pred p;\n\t"
                "MXG_WAIT:\n\t"
@@ -94,7 +88,7 @@ __device__ __forceinline__ void mbar_wait(u64 *bar, unsigned phase) {
 }
 // contiguous bytes global -> shared, completion on `bar`
 __device__ __forceinline__ void
-    bulk_copy(void *dst, const void *src, unsigned bytes, u64 *bar) {
+    bulk_copy(void *dst, void const *src, unsigned bytes, u64 *bar) {
   asm volatile("cp.async.bulk.shared::cluster.global.mbarrier::complete_tx::"
                "bytes [%0], [%1], %2, [%3];" ::"r"(sm_u32(dst)),
                "l"(reinterpret_cast<u64>(src)),
@@ -102,7 +96,7 @@ __device__ __forceinline__ void
                "r"(sm_u32(bar))
                : "memory");
 }
-__device__ __forceinline__ void cp_async16(void *dst, const void *src) {
+__device__ __forceinline__ void cp_async16(void *dst, void const *src) {
   asm volatile("cp.async.cg.shared.global [%0], [%1], 16;" ::"r"(sm_u32(dst)),
                "l"(reinterpret_cast<u64>(src))
                : "memory");
@@ -129,14 +123,14 @@ __device__ __forceinline__ u64 smem_desc(unsigned addr) {
 // one 128 x n x 16 MMA; A in shared memory
 __device__ __forceinline__ void
     umma_ss(unsigned td, u64 ad, u64 bd, uint32_t ides, int acc) {
-  asm volatile("{\n\t.reg .pred p;\n\tsetp.ne.b32 p, %4, 0;\n\t"
-               "tcgen05.mma.cta_group::1.kind::f16 [%0], %1, %2, %3, p;\n\t}" ::
-                   "r"(td),
-               "l"(ad),
-               "l"(bd),
-               "r"(ides),
-               "r"(acc)
-               : "memory");
+  asm volatile(
+      "{\n\t.reg .pred p;\n\tsetp.ne.b32 p, %4, 0;\n\t"
+      "tcgen05.mma.cta_group::1.kind::f16 [%0], %1, %2, %3, p;\n\t}" ::"r"(td),
+      "l"(ad),
+      "l"(bd),
+      "r"(ides),
+      "r"(acc)
+      : "memory");
 }
 // A in TMEM (8 columns hold the 16 values of a row)
 __device__ __forceinline__ void
@@ -174,31 +168,30 @@ __device__ __forceinline__ void tmem_free512(unsigned base) {
       : "memory");
 }
 __device__ __forceinline__ void tmem_ld16(unsigned addr, unsigned (&v)[16]) {
-  asm volatile(
-      "tcgen05.ld.sync.aligned.32x32b.x16.b32 "
-      "{%0,%1,%2,%3,%4,%5,%6,%7,%8,%9,%10,%11,%12,%13,%14,%15}, [%16];"
-      : "=r"(v[0]),
-        "=r"(v[1]),
-        "=r"(v[2]),
-        "=r"(v[3]),
-        "=r"(v[4]),
-        "=r"(v[5]),
-        "=r"(v[6]),
-        "=r"(v[7]),
-        "=r"(v[8]),
-        "=r"(v[9]),
-        "=r"(v[10]),
-        "=r"(v[11]),
-        "=r"(v[12]),
-        "=r"(v[13]),
-        "=r"(v[14]),
-        "=r"(v[15])
-      : "r"(addr)
-      : "memory");
+  asm volatile("tcgen05.ld.sync.aligned.32x32b.x16.b32 "
+               "{%0,%1,%2,%3,%4,%5,%6,%7,%8,%9,%10,%11,%12,%13,%14,%15}, [%16];"
+               : "=r"(v[0]),
+                 "=r"(v[1]),
+                 "=r"(v[2]),
+                 "=r"(v[3]),
+                 "=r"(v[4]),
+                 "=r"(v[5]),
+                 "=r"(v[6]),
+                 "=r"(v[7]),
+                 "=r"(v[8]),
+                 "=r"(v[9]),
+                 "=r"(v[10]),
+                 "=r"(v[11]),
+                 "=r"(v[12]),
+                 "=r"(v[13]),
+                 "=r"(v[14]),
+                 "=r"(v[15])
+               : "r"(addr)
+               : "memory");
   asm volatile("tcgen05.wait::ld.sync.aligned;" ::: "memory");
 }
-__device__ __forceinline__ void
-    tmem_st32(unsigned addr, const unsigned (&v)[32]) {
+__device__ __forceinline__ void tmem_st32(unsigned addr,
+                                          unsigned const (&v)[32]) {
   asm volatile(
       "tcgen05.st.sync.aligned.32x32b.x32.b32 [%0], "
       "{%1,%2,%3,%4,%5,%6,%7,%8,%9,%10,%11,%12,%13,%14,%15,%16,"
@@ -315,8 +308,8 @@ __device__ __forceinline__ void rows_sync() {
 
 // ---------------------------------------------------------------------------
 // Routing. inputs: [0] logits bf16 [BATCH][LSTRIDE]: the E router logits and,
-// with SHARED, the shared expert's gate logit in column E. outputs: [0] weights fp32
-// [BATCH][TOPK + SHARED] (softmax over the chosen logits; sigmoid for the
+// with SHARED, the shared expert's gate logit in column E. outputs: [0] weights
+// fp32 [BATCH][TOPK + SHARED] (softmax over the chosen logits; sigmoid for the
 // shared expert; both rounded to bf16 as the reference models do);
 // [1] plan list int32 [E + SHARED][BATCH], entries (token << 8) | slot;
 // [2] plan meta int32 [1 + CAP + E + SHARED]: [0] the number of (expert, pass)
@@ -342,26 +335,26 @@ template <int BATCH,
           int G,
           class TD,
           class RC>
-__device__ __forceinline__ void
-    moe_route_sm100(TD const *task_desc, RC const &runtime_config) {
+__device__ __forceinline__ void moe_route_sm100(TD const *task_desc,
+                                                RC const &runtime_config) {
   using namespace mxg;
   constexpr int E_TOT = E + SHARED, SLOTS = TOPK + SHARED, VPL = E / 32;
   static_assert(E % 32 == 0 && VPL >= 1 && VPL <= 8, "E / 32 logits a lane");
   static_assert(TOPK + SHARED <= 32, "a lane per slot");
   static_assert(BATCH < (1 << 23), "token index in 24 bits");
-  const unsigned short *logits =
-      static_cast<const unsigned short *>(task_desc->input_ptrs[0]);
+  unsigned short const *logits =
+      static_cast<unsigned short const *>(task_desc->input_ptrs[0]);
   float *weight = static_cast<float *>(task_desc->output_ptrs[0]);
   int *list = static_cast<int *>(task_desc->output_ptrs[1]);
   int *meta = static_cast<int *>(task_desc->output_ptrs[2]);
 
   extern __shared__ char shared_memory[];
-  const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
-  const int nwarps = blockDim.x >> 5;
-  const int task_i = static_cast<int>(task_desc->task_metadata.ext_bid_x);
+  int const tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
+  int const nwarps = blockDim.x >> 5;
+  int const task_i = static_cast<int>(task_desc->task_metadata.ext_bid_x);
   int *sm = reinterpret_cast<int *>(
       (reinterpret_cast<uintptr_t>(shared_memory) + 15) / 16 * 16);
-  int *tot = sm;                       // [8] plan entries of a warp's experts
+  int *tot = sm; // [8] plan entries of a warp's experts
   int *cnt = G > 1 ? static_cast<int *>(task_desc->input_ptrs[1]) : sm + 8;
   if (G == 1) {
     for (int i = tid; i < E_TOT; i += blockDim.x) {
@@ -371,11 +364,11 @@ __device__ __forceinline__ void
   }
 
   for (int t = task_i * nwarps + warp; t < BATCH; t += G * nwarps) {
-    const unsigned short *lr = logits + static_cast<size_t>(t) * LSTRIDE;
+    unsigned short const *lr = logits + static_cast<size_t>(t) * LSTRIDE;
     unsigned raw[VPL];
     if (VPL == 8 && LSTRIDE % 8 == 0) {
-      const uint4 v = reinterpret_cast<const uint4 *>(lr)[lane];
-      const unsigned w[4] = {v.x, v.y, v.z, v.w};
+      const uint4 v = reinterpret_cast<uint4 const *>(lr)[lane];
+      unsigned const w[4] = {v.x, v.y, v.z, v.w};
 #pragma unroll
       for (int j = 0; j < VPL; ++j) {
         raw[j] = (w[(j / 2) & 3] >> (16 * (j & 1))) & 0xffff;
@@ -415,12 +408,12 @@ __device__ __forceinline__ void
         }
       }
     }
-    const int sel_idx = static_cast<int>(0xffffu - (sel & 0xffffu));
-    const unsigned so = sel >> 16;
-    const float sel_val = bf2f(static_cast<unsigned short>(
+    int const sel_idx = static_cast<int>(0xffffu - (sel & 0xffffu));
+    unsigned const so = sel >> 16;
+    float const sel_val = bf2f(static_cast<unsigned short>(
         (so & 0x8000u) ? (so ^ 0x8000u) : (~so & 0xffffu)));
-    const float top = __shfl_sync(0xffffffffu, sel_val, 0);
-    const float ex = lane < TOPK ? __expf(sel_val - top) : 0.f;
+    float const top = __shfl_sync(0xffffffffu, sel_val, 0);
+    float const ex = lane < TOPK ? __expf(sel_val - top) : 0.f;
     float sum = ex;
 #pragma unroll
     for (int off = 16; off > 0; off >>= 1) {
@@ -428,10 +421,10 @@ __device__ __forceinline__ void
     }
     if (lane < TOPK) {
       weight[static_cast<size_t>(t) * SLOTS + lane] = bfround(ex / sum);
-      const int pos = atomicAdd(&cnt[sel_idx], 1);
+      int const pos = atomicAdd(&cnt[sel_idx], 1);
       list[static_cast<size_t>(sel_idx) * BATCH + pos] = (t << 8) | lane;
     } else if (SHARED && lane == TOPK) {
-      const float g = bf2f(lr[E]);
+      float const g = bf2f(lr[E]);
       weight[static_cast<size_t>(t) * SLOTS + TOPK] =
           bfround(1.f / (1.f + __expf(fminf(-g, 40.f))));
       list[static_cast<size_t>(E) * BATCH + t] = (t << 8) | TOPK;
@@ -447,7 +440,7 @@ __device__ __forceinline__ void
       return;
     }
     if (tid == 0) {
-      while (*reinterpret_cast<volatile int *>(&cnt[E_TOT]) != G) {
+      while (*reinterpret_cast<int volatile *>(&cnt[E_TOT]) != G) {
       }
     }
     __syncthreads();
@@ -456,8 +449,8 @@ __device__ __forceinline__ void
   // ---- the plan: the (expert, pass) pairs in expert order, the counts
   int c = 0, np = 0, pre = 0;
   if (warp < VPL) {
-    const int e = 32 * warp + lane;
-    c = *reinterpret_cast<volatile int *>(&cnt[e]);
+    int const e = 32 * warp + lane;
+    c = *reinterpret_cast<int volatile *>(&cnt[e]);
     if (G > 1) {
       cnt[e] = 0; // (for the next wave)
     }
@@ -465,7 +458,7 @@ __device__ __forceinline__ void
     pre = np;
 #pragma unroll
     for (int off = 1; off < 32; off <<= 1) {
-      const int o = __shfl_up_sync(0xffffffffu, pre, off);
+      int const o = __shfl_up_sync(0xffffffffu, pre, off);
       if (lane >= off) {
         pre += o;
       }
@@ -478,15 +471,15 @@ __device__ __forceinline__ void
   int base = 0, all = 0;
 #pragma unroll
   for (int w = 0; w < VPL; ++w) {
-    const int v = tot[w];
+    int const v = tot[w];
     all += v;
     if (w < warp) {
       base += v;
     }
   }
   if (warp < VPL) {
-    const int e = 32 * warp + lane;
-    const int first = base + pre - np;
+    int const e = 32 * warp + lane;
+    int const first = base + pre - np;
     for (int p = 0; p < np; ++p) {
       meta[1 + first + p] = (e << 16) | p;
     }
@@ -495,7 +488,7 @@ __device__ __forceinline__ void
   if (tid == 0) {
     int n = all;
     if (SHARED) { // the shared expert: every token, after the routed ones
-      const int nps = (BATCH + NT - 1) / NT;
+      int const nps = (BATCH + NT - 1) / NT;
       for (int p = 0; p < nps; ++p) {
         meta[1 + all + p] = (E << 16) | p;
       }
@@ -516,7 +509,8 @@ __device__ __forceinline__ void
 // meta; [4] (HAS_BIAS) bias bf16 [E_TOT][ROWS].
 // outputs: [0] bf16 [BATCH][SLOTS][ROWS], or with ACT [BATCH][SLOTS][ROWS / 2]:
 // the rows are (gate, up) pairs and the output is
-//   (clamp(up, -LIMIT, LIMIT) + OFF) * g * sigmoid(ALPHA * g), g = min(gate, LIMIT)
+//   (clamp(up, -LIMIT, LIMIT) + OFF) * g * sigmoid(ALPHA * g),
+//   g = min(gate, LIMIT)
 // (LIMIT = inf, OFF = 0, ALPHA = 1: SiLU(gate) * up).
 // DENSE: an ordinary linear layer on the same machinery -- one "expert", every
 // token, in passes of NT; the inputs are [0] activations [BATCH][K], [1] the
@@ -561,8 +555,8 @@ template <int MX,
           int KS,
           class TD,
           class RC>
-__device__ __forceinline__ void
-    moe_gemm_sm100(TD const *task_desc, RC const &runtime_config) {
+__device__ __forceinline__ void moe_gemm_sm100(TD const *task_desc,
+                                               RC const &runtime_config) {
   using namespace mxg;
   constexpr int RB = (ROWS + 127) / 128; // row blocks of an expert
   constexpr int NKB = K / KB;            // steps of a unit
@@ -583,33 +577,26 @@ __device__ __forceinline__ void
   // second thread (warp 7) issues every other MMA, into an accumulator of
   // its own, and the gather makes do with warp 6. Not at NT 64 with MXFP4,
   // where the second accumulators would cost two of the four A stages.
-#ifdef MXG_MMA2
-  constexpr bool MMA2 = MXG_MMA2;
-#else
   constexpr bool MMA2 = NT <= 32 || (!MX && NT <= 64);
-#endif
-  constexpr int NMT = MMA2 ? 2 : 1;  // threads that issue MMAs
-  constexpr int GL = MMA2 ? 32 : 64; // lanes of the gather
-#ifdef MXG_NACC
-  constexpr int NACC = MXG_NACC;
-#else
-  constexpr int NACC = NMT;
-#endif
+  constexpr int NMT = MMA2 ? 2 : 1;   // threads that issue MMAs
+  constexpr int GL = MMA2 ? 32 : 64;  // lanes of the gather
+  constexpr int NACC = NMT;           // accumulators of a unit
   constexpr int ACC_COLS = NACC * NT; // TMEM columns of an accumulator stage
   // rows of a B box: the most tokens a pass can have
   constexpr int BROWS = ((NT < BATCH ? NT : BATCH) + 7) / 8 * 8;
-  constexpr int BBOX = BROWS * 128;  // bytes of a B box
-  constexpr int BSTG = TPB * BBOX;   // bytes of a B stage
-  constexpr int NTL = BROWS / 8;     // gather: tokens of a lane
-  constexpr int MAXU = 64;           // units of a task
+  constexpr int BBOX = BROWS * 128; // bytes of a B box
+  constexpr int BSTG = TPB * BBOX;  // bytes of a B stage
+  constexpr int NTL = BROWS / 8;    // gather: tokens of a lane
+  constexpr int MAXU = 64;          // units of a task
   constexpr int SMEM_TOTAL = 196 * 1024;
   // MX: up to 100 KB of B stages, the rest for weight copies (13 KB each).
   // bf16: two B stages reserved, weight copies (16 KB a 64-column tile) in
   // the rest, then B stages in what they leave.
   constexpr int STG_MAX = MX ? 8 : 6;
-  constexpr int STGB_MX = (100 * 1024) / BSTG >= NKB
-                              ? NKB
-                              : ((100 * 1024) / BSTG < 2 ? 2 : (100 * 1024) / BSTG);
+  constexpr int STGB_MX =
+      (100 * 1024) / BSTG >= NKB
+          ? NKB
+          : ((100 * 1024) / BSTG < 2 ? 2 : (100 * 1024) / BSTG);
   constexpr int STG_BF = (SMEM_TOTAL - 8192 - 2 * BSTG) / ABLK;
   constexpr int STG_FIT = MX ? (SMEM_TOTAL - 8192 - STGB_MX * BSTG) / ABLK
                              : (STG_BF < 1 ? 1 : STG_BF);
@@ -651,8 +638,8 @@ __device__ __forceinline__ void
   static_assert(SMEM + 2048 <= SMEM_TOTAL, "shared memory");
   static_assert(E_TOT < 32768 && SLOTS <= 256, "plan entry fields");
 
-  const char *x = static_cast<const char *>(task_desc->input_ptrs[0]);
-  const char *wpack = static_cast<const char *>(task_desc->input_ptrs[1]);
+  char const *x = static_cast<char const *>(task_desc->input_ptrs[0]);
+  char const *wpack = static_cast<char const *>(task_desc->input_ptrs[1]);
   constexpr int IDX_BIAS = DENSE ? 2 : 4;
   constexpr int IDX_RES = IDX_BIAS + HAS_BIAS;
   constexpr int OS = OSTRIDE ? OSTRIDE : OUT; // the output's row stride
@@ -662,25 +649,25 @@ __device__ __forceinline__ void
   static_assert(KS >= 1 && KS <= NKB, "parts of a unit's K steps");
   constexpr int IDX_TOK = IDX_RES + RES + MXG_TRACE_INPUTS;
   constexpr int IDX_PART = IDX_TOK + HELD;
-  float *kpart = KS > 1 ? static_cast<float *>(task_desc->input_ptrs[IDX_PART])
-                        : nullptr;
+  float *kpart =
+      KS > 1 ? static_cast<float *>(task_desc->input_ptrs[IDX_PART]) : nullptr;
   int *kcnt = KS > 1 ? static_cast<int *>(task_desc->input_ptrs[IDX_PART + 1])
                      : nullptr;
-  const int *rlist =
-      DENSE ? nullptr : static_cast<const int *>(task_desc->input_ptrs[2]);
-  const int *meta =
-      DENSE ? nullptr : static_cast<const int *>(task_desc->input_ptrs[3]);
-  const unsigned short *bias =
+  int const *rlist =
+      DENSE ? nullptr : static_cast<int const *>(task_desc->input_ptrs[2]);
+  int const *meta =
+      DENSE ? nullptr : static_cast<int const *>(task_desc->input_ptrs[3]);
+  unsigned short const *bias =
       HAS_BIAS
-          ? static_cast<const unsigned short *>(task_desc->input_ptrs[IDX_BIAS])
+          ? static_cast<unsigned short const *>(task_desc->input_ptrs[IDX_BIAS])
           : nullptr;
-  const unsigned short *resid =
-      RES ? static_cast<const unsigned short *>(task_desc->input_ptrs[IDX_RES])
+  unsigned short const *resid =
+      RES ? static_cast<unsigned short const *>(task_desc->input_ptrs[IDX_RES])
           : nullptr;
   unsigned short *out =
       static_cast<unsigned short *>(task_desc->output_ptrs[0]);
-  const int task_i = static_cast<int>(task_desc->task_metadata.ext_bid_x);
-  const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
+  int const task_i = static_cast<int>(task_desc->task_metadata.ext_bid_x);
+  int const tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
 #ifdef MXG_TRACE
   long long *mxg_tr =
       static_cast<long long *>(task_desc->input_ptrs[IDX_RES + RES]) +
@@ -711,9 +698,9 @@ __device__ __forceinline__ void
   u64 *bar_flush = reinterpret_cast<u64 *>(
       (reinterpret_cast<uintptr_t>(shared_memory) +
        mirage::runtime::MAX_DYNAMIC_SHARED_MEMORY_SIZE - BARWIN + 7) /
-      8 * 8);                    // [8]: a warp's own (see below)
-  u64 *x_full = bar_flush + 8;   // a weight copy landed
-  u64 *x_empty = x_full + STG;   // ... and was consumed
+      8 * 8);                   // [8]: a warp's own (see below)
+  u64 *x_full = bar_flush + 8;  // a weight copy landed
+  u64 *x_empty = x_full + STG;  // ... and was consumed
   u64 *a_ready = x_empty + STG; // MX: an A stage is in TMEM
   u64 *a_empty = a_ready + SA;  // MX: ... and the MMAs have read it
   u64 *b_full = a_empty + SA;
@@ -721,8 +708,8 @@ __device__ __forceinline__ void
   u64 *acc_full = b_empty + STGB;
   u64 *acc_empty = acc_full + AS;
   int *ut = reinterpret_cast<int *>(breg + BREG); // [MAXU][4]
-  int *elist = ut + 4 * MAXU;                        // [2][NT]
-  int *misc = elist + 2 * NT;                        // n_ep, tmem base
+  int *elist = ut + 4 * MAXU;                     // [2][NT]
+  int *misc = elist + 2 * NT;                     // n_ep, tmem base
 
   int n_ep = NPASS;
   if (!DENSE) {
@@ -732,8 +719,8 @@ __device__ __forceinline__ void
     __syncthreads();
     n_ep = misc[0];
   }
-  const int total = n_ep * RB * KS;
-  const int n_my = total > task_i ? (total - task_i - 1) / G + 1 : 0;
+  int const total = n_ep * RB * KS;
+  int const n_my = total > task_i ? (total - task_i - 1) / G + 1 : 0;
   if (!DENSE && n_my > MAXU) {
     __trap();
   }
@@ -751,9 +738,7 @@ __device__ __forceinline__ void
   // iteration (which records the address, top bit set, in the token tensor)
   // to the release wave.
   int *held_tok =
-      HELD ? static_cast<int *>(
-                 task_desc->input_ptrs[IDX_TOK]) +
-                 blockIdx.x
+      HELD ? static_cast<int *>(task_desc->input_ptrs[IDX_TOK]) + blockIdx.x
            : nullptr;
   // The window holds the last GEMM task's barriers, and the SM its states of
   // them: the first mbarrier.init of a task (a store, then an invalidation
@@ -775,10 +760,10 @@ __device__ __forceinline__ void
   // that task had them -- MPK's linear layers have theirs where the unit
   // table below is.)
   if (!DENSE && tid < n_my) {
-    const int u = (task_i + tid * G) / KS;
-    const int ent = meta[1 + u / RB];
-    const int e = ent >> 16, p = ent & 0xffff;
-    const int left = meta[1 + CAP + e] - p * NT;
+    int const u = (task_i + tid * G) / KS;
+    int const ent = meta[1 + u / RB];
+    int const e = ent >> 16, p = ent & 0xffff;
+    int const left = meta[1 + CAP + e] - p * NT;
     ut[tid * 4 + 0] = e;
     ut[tid * 4 + 1] = p;
     ut[tid * 4 + 2] = u % RB;
@@ -786,21 +771,20 @@ __device__ __forceinline__ void
   }
   static_assert(NBAR <= 224, "a barrier a thread of warps 0 .. 6");
   if (tid < NBAR) {
-    const int i = tid;
-    const int count =
-        i < STG ? 1
-        : i < 2 * STG ? (MX ? 4 : NMT)
-        : i < 2 * STG + SA ? 4
-        : i < 2 * STG + 2 * SA ? NMT
-        : i < 2 * STG + 2 * SA + STGB ? GL
-        : i < 2 * STG + 2 * SA + 2 * STGB ? NMT
-        : i < 2 * STG + 2 * SA + 2 * STGB + AS ? NMT
-        : 4;
+    int const i = tid;
+    int const count = i < STG                                ? 1
+                      : i < 2 * STG                          ? (MX ? 4 : NMT)
+                      : i < 2 * STG + SA                     ? 4
+                      : i < 2 * STG + 2 * SA                 ? NMT
+                      : i < 2 * STG + 2 * SA + STGB          ? GL
+                      : i < 2 * STG + 2 * SA + 2 * STGB      ? NMT
+                      : i < 2 * STG + 2 * SA + 2 * STGB + AS ? NMT
+                                                             : 4;
     mbar_init(&x_full[i], count);
     asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
   }
-  const int held = HELD ? *held_tok : 0; // (every thread reads it itself)
-  const bool have_tmem = held < 0;
+  int const held = HELD ? *held_tok : 0; // (every thread reads it itself)
+  bool const have_tmem = held < 0;
   if (!have_tmem && warp == 0) {
     tmem_alloc512(reinterpret_cast<unsigned *>(&misc[1]));
     tmem_fence_before();
@@ -816,8 +800,8 @@ __device__ __forceinline__ void
   }
 #endif
   // the accumulators
-  const unsigned tb = static_cast<unsigned>(
-      have_tmem ? (held & 0x7fffffff) : misc[1]);
+  unsigned const tb =
+      static_cast<unsigned>(have_tmem ? (held & 0x7fffffff) : misc[1]);
   // unit j of this task: expert, pass, row block, tokens
   auto unit_at = [&](int j, int &e, int &p, int &rb, int &n) {
     if (DENSE) {
@@ -843,20 +827,20 @@ __device__ __forceinline__ void
     kb1 = (q + 1) * NKB / KS;
   };
   // entry ci of a pass's token list: (token << 8) | slot
-  auto entry_at = [&](const int *el, int p, int ci) {
+  auto entry_at = [&](int const *el, int p, int ci) {
     return DENSE ? ((p * NT + ci) << 8) : el[ci];
   };
-  const unsigned ta = tb + AS * ACC_COLS;             // MX: A stages
-  const float LIMIT = __int_as_float(LIMIT_BITS);
-  const float ALPHA = __int_as_float(ALPHA_BITS);
-  const float OFF = __int_as_float(OFF_BITS);
+  unsigned const ta = tb + AS * ACC_COLS; // MX: A stages
+  float const LIMIT = __int_as_float(LIMIT_BITS);
+  float const ALPHA = __int_as_float(ALPHA_BITS);
+  float const OFF = __int_as_float(OFF_BITS);
 
   if (warp < 4) {
     // ---- the 128 rows: dequantize (MX) and run the epilogues. A unit's
     // epilogue waits for its last MMA; the next unit's blocks are converted
     // meanwhile, and the epilogue runs between two of them.
-    const int q = warp, row = tid;
-    const unsigned qrow = static_cast<unsigned>(q * 32) << 16;
+    int const q = warp, row = tid;
+    unsigned const qrow = static_cast<unsigned>(q * 32) << 16;
     float bias_v[2] = {0.f, 0.f}; // of the units in flight (by parity)
     int epi = 0;                  // the units whose epilogue has run
     auto epilogue = [&](int j) {
@@ -871,9 +855,9 @@ __device__ __forceinline__ void
       int pq, uid, kb0_, kb1_;
       part_at(j, pq, uid, kb0_, kb1_);
       // this warp's rows of the unit's parts: [KS][32 rows][NT] in the scratch
-      float *prow = KS > 1 ? kpart + ((static_cast<size_t>(uid) * KS) * 128 +
-                                      row) * NT
-                           : nullptr;
+      float *prow =
+          KS > 1 ? kpart + ((static_cast<size_t>(uid) * KS) * 128 + row) * NT
+                 : nullptr;
       bool finish = true;
       if (KS > 1) {
 #pragma unroll 1
@@ -895,10 +879,10 @@ __device__ __forceinline__ void
           }
 #pragma unroll
           for (int c4 = 0; c4 < 4; ++c4) {
-            *reinterpret_cast<float4 *>(prow + static_cast<size_t>(pq) * 128 * NT +
-                                        c0 + 4 * c4) =
-                make_float4(pa[4 * c4], pa[4 * c4 + 1], pa[4 * c4 + 2],
-                            pa[4 * c4 + 3]);
+            *reinterpret_cast<float4 *>(
+                prow + static_cast<size_t>(pq) * 128 * NT + c0 + 4 * c4) =
+                make_float4(
+                    pa[4 * c4], pa[4 * c4 + 1], pa[4 * c4 + 2], pa[4 * c4 + 3]);
           }
         }
         __threadfence();
@@ -965,11 +949,7 @@ __device__ __forceinline__ void
         }
         // (a loop, not 16 copies: the epilogue runs once a unit, and code
         // that runs once costs its fetch)
-#ifdef MXG_EPI_UNROLL
-#pragma unroll
-#else
 #pragma unroll 1
-#endif
         for (int c = 0; c < 16; ++c) {
           const int ci = c0 + c;
           // as the reference: the product rounded to bf16, then the bias
@@ -1011,7 +991,7 @@ __device__ __forceinline__ void
     for (int j = 0; j < n_my; ++j) {
       int e, p, rb, n;
       unit_at(j, e, p, rb, n);
-      const int grow = rb * 128 + row;
+      int const grow = rb * 128 + row;
       // unit j takes over unit j - 2's list and accumulator stage
       if (epi + 2 <= j) {
         mbar_wait(&acc_full[epi % AS], (epi / AS) & 1);
@@ -1044,13 +1024,13 @@ __device__ __forceinline__ void
             epilogue(epi);
             ++epi;
           }
-          const int s = gs % STG, sa = gs % SA;
+          int const s = gs % STG, sa = gs % SA;
 #ifdef MXG_TRACE
-          const long long tw0 = mxg_now();
+          long long const tw0 = mxg_now();
 #endif
           mbar_wait(&x_full[s], (gs / STG) & 1);
 #ifdef MXG_TRACE
-          const long long tw1 = mxg_now();
+          long long const tw1 = mxg_now();
           tr_x += tw1 - tw0;
           if (tid == 0 && kb == kb0 && j < 4) {
             MXG_T(8 + 12 * j + 1);
@@ -1069,26 +1049,21 @@ __device__ __forceinline__ void
           }
 #endif
           tmem_fence_after();
-          const unsigned char *blk =
-              reinterpret_cast<const unsigned char *>(areg) + s * ABLK;
+          unsigned char const *blk =
+              reinterpret_cast<unsigned char const *>(areg) + s * ABLK;
           // (a loop over the block's tiles: as fast as its copies once
           // warm, and a third of the code to fetch on a task's first block)
 #pragma unroll 1
           for (int h = 0; h < TPB; ++h) {
             unsigned v[32];
-#ifdef MXG_ABL_NO_DQ
-            if (gs > 0) {
-              continue;
-            }
-#endif
 #pragma unroll
             for (int cc = 0; cc < 2; ++cc) {
-              const int c = 2 * h + cc;
-              const unsigned sb = blk[NCH * 128 * 16 + row * NCH + c];
-              const unsigned s2 = ((sb + 112u) << 7) * 0x00010001u;
-              const unsigned c2 = (0x8000u | ((sb + 3u) << 7)) * 0x00010001u;
-              const uint4 w4 = *reinterpret_cast<const uint4 *>(
-                  blk + (c * 128 + row) * 16);
+              int const c = 2 * h + cc;
+              unsigned const sb = blk[NCH * 128 * 16 + row * NCH + c];
+              unsigned const s2 = ((sb + 112u) << 7) * 0x00010001u;
+              unsigned const c2 = (0x8000u | ((sb + 3u) << 7)) * 0x00010001u;
+              const uint4 w4 =
+                  *reinterpret_cast<uint4 const *>(blk + (c * 128 + row) * 16);
               cvt4_scale(w4.x, s2, c2, &v[cc * 16 + 0]);
               cvt4_scale(w4.y, s2, c2, &v[cc * 16 + 4]);
               cvt4_scale(w4.z, s2, c2, &v[cc * 16 + 8]);
@@ -1160,13 +1135,12 @@ __device__ __forceinline__ void
       for (int j = 0; j < n_my; ++j) {
         int e, p_, rb, n_;
         unit_at(j, e, p_, rb, n_);
-        const char *src =
-            wpack + static_cast<size_t>(e * RB + rb) * NKB * ABLK;
+        char const *src = wpack + static_cast<size_t>(e * RB + rb) * NKB * ABLK;
         int pq, uid_, kb0, kb1;
         part_at(j, pq, uid_, kb0, kb1);
 #pragma unroll 1
         for (int kb = kb0; kb < kb1; ++kb, ++gs) {
-          const int s = gs % STG;
+          int const s = gs % STG;
 #ifdef MXG_TRACE
           if (j == 0 && kb < 24) {
             mxg_tr[64 + 8 * kb + 0] = mxg_now(); // asks for the stage
@@ -1191,20 +1165,20 @@ __device__ __forceinline__ void
   } else if (warp == 5 || (MMA2 && warp == 7)) {
     // ---- the MMAs (MMA2: this thread's half of them)
     if (lane == 0) {
-      const int half = warp == 7 ? 1 : 0;
+      int const half = warp == 7 ? 1 : 0;
       int gs = 0;
 #pragma unroll 1
       for (int j = 0; j < n_my; ++j) {
         int e_, p_, rb_, n;
         unit_at(j, e_, p_, rb_, n);
-        const int nr = n > 16 ? (n + 15) & ~15 : 16;
+        int const nr = n > 16 ? (n + 15) & ~15 : 16;
         const uint32_t ides = idesc(128, nr);
-        const int st = j % AS;
+        int const st = j % AS;
         if (j >= AS) {
           mbar_wait(&acc_empty[st], ((j / AS) - 1) & 1);
         }
         tmem_fence_after();
-        const unsigned td = tb + st * ACC_COLS;
+        unsigned const td = tb + st * ACC_COLS;
         int mi = 0; // MMAs of the unit so far
 #ifdef MXG_TRACE
         long long tr_b = 0, tr_a = 0, tr_i = 0, tr_c = 0;
@@ -1213,13 +1187,13 @@ __device__ __forceinline__ void
         part_at(j, pq, uid_, kb0, kb1);
 #pragma unroll 1
         for (int kb = kb0; kb < kb1; ++kb, ++gs) {
-          const int bs = B2X ? (j & 1) * NKB + kb : gs % STGB, sa = gs % SA;
+          int const bs = B2X ? (j & 1) * NKB + kb : gs % STGB, sa = gs % SA;
 #ifdef MXG_TRACE
-          const long long tw0 = mxg_now();
+          long long const tw0 = mxg_now();
 #endif
           mbar_wait(&b_full[bs], (B2X ? j / 2 : gs / STGB) & 1);
 #ifdef MXG_TRACE
-          const long long tw1 = mxg_now();
+          long long const tw1 = mxg_now();
 #endif
           if (MX) {
             mbar_wait(&a_ready[sa], (gs / SA) & 1);
@@ -1228,7 +1202,7 @@ __device__ __forceinline__ void
           }
           tmem_fence_after();
 #ifdef MXG_TRACE
-          const long long tw2 = mxg_now();
+          long long const tw2 = mxg_now();
 #endif
           // (unrolled: a loop here costs the MMA thread a quarter more per
           // MMA while the conversion warps keep the SM busy)
@@ -1239,17 +1213,12 @@ __device__ __forceinline__ void
             for (int k2 = 0; k2 < 4 / NMT; ++k2, ++mi) {
               static_assert((TPB * 4) % NACC == 0, "accumulator of an MMA");
               static_assert(!MMA2 || NACC == 2, "an accumulator a thread");
-              const int kk = MMA2 ? 2 * k2 + half : k2;
-              const int accf =
-                  MMA2 ? ((kb > kb0 || b > 0 || k2 > 0) ? 1 : 0)
-                       : ((kb > kb0 || b * 4 + kk >= NACC) ? 1 : 0);
-              const unsigned tdm =
+              int const kk = MMA2 ? 2 * k2 + half : k2;
+              int const accf = MMA2
+                                   ? ((kb > kb0 || b > 0 || k2 > 0) ? 1 : 0)
+                                   : ((kb > kb0 || b * 4 + kk >= NACC) ? 1 : 0);
+              unsigned const tdm =
                   td + (MMA2 ? half : (b * 4 + kk) % NACC) * NT;
-#ifdef MXG_ABL_NO_MMA
-              if (mi > 0) {
-                continue;
-              }
-#endif
               if (MX) {
                 umma_ts(tdm,
                         ta + sa * ACOLS + (b * 4 + kk) * 8,
@@ -1267,14 +1236,14 @@ __device__ __forceinline__ void
             }
           }
 #ifdef MXG_TRACE
-          const long long tw3 = mxg_now();
+          long long const tw3 = mxg_now();
 #endif
           if (!B2X) {
             umma_commit(&b_empty[bs]);
           }
           umma_commit(MX ? &a_empty[sa] : &x_empty[sa]);
 #ifdef MXG_TRACE
-          const long long tw4 = mxg_now();
+          long long const tw4 = mxg_now();
           tr_b += tw1 - tw0;
           tr_a += tw2 - tw1;
           tr_i += tw3 - tw2;
@@ -1304,25 +1273,25 @@ __device__ __forceinline__ void
     // eight 16 B chunks of every 8th token in every box (row r of a box,
     // chunk c: SWIZZLE_128B puts it at chunk c ^ (r & 7))
     constexpr int CPL = 64 / GL;
-    const int gl = MMA2 ? lane : (warp - 6) * 32 + lane;
-    const int tsub = gl / (8 / CPL), c0 = (gl % (8 / CPL)) * CPL;
+    int const gl = MMA2 ? lane : (warp - 6) * 32 + lane;
+    int const tsub = gl / (8 / CPL), c0 = (gl % (8 / CPL)) * CPL;
     int gs = 0;
 #pragma unroll 1
     for (int j = 0; j < n_my; ++j) {
       int e, p, rb_, n;
       unit_at(j, e, p, rb_, n);
-      const char *src[NTL];
+      char const *src[NTL];
 #pragma unroll
       for (int it = 0; it < NTL; ++it) {
-        const int jt = tsub + 8 * it;
+        int const jt = tsub + 8 * it;
         src[it] = nullptr;
         if (jt < n) {
-          const int ent =
+          int const ent =
               DENSE ? ((p * NT + jt) << 8)
                     : rlist[static_cast<size_t>(e) * BATCH + p * NT + jt];
-          const size_t r = IN_SLOTTED ? static_cast<size_t>(ent >> 8) * SLOTS +
-                                            (ent & 0xff)
-                                      : static_cast<size_t>(ent >> 8);
+          const size_t r =
+              IN_SLOTTED ? static_cast<size_t>(ent >> 8) * SLOTS + (ent & 0xff)
+                         : static_cast<size_t>(ent >> 8);
           src[it] = x + r * (K * 2);
         }
       }
@@ -1334,20 +1303,20 @@ __device__ __forceinline__ void
       part_at(j, pq, uid_, kb0, kb1);
 #pragma unroll 1
       for (int kb = kb0; kb < kb1; ++kb, ++gs) {
-        const int bs = B2X ? (j & 1) * NKB + kb : gs % STGB;
+        int const bs = B2X ? (j & 1) * NKB + kb : gs % STGB;
         if (!B2X && gs >= STGB) {
           mbar_wait(&b_empty[bs], ((gs / STGB) - 1) & 1);
         }
         char *bst = breg + bs * BSTG;
 #pragma unroll
         for (int it = 0; it < NTL; ++it) {
-          const int jt = tsub + 8 * it;
+          int const jt = tsub + 8 * it;
           if (jt < n) {
 #pragma unroll
             for (int b = 0; b < TPB; ++b) {
 #pragma unroll
               for (int cc = 0; cc < CPL; ++cc) {
-                const int c = c0 + cc;
+                int const c = c0 + cc;
                 cp_async16(bst + b * BBOX + jt * 128 + ((c ^ (jt & 7)) << 4),
                            src[it] + c * 16 + (kb * KB + b * 64) * 2);
               }
@@ -1398,23 +1367,24 @@ template <int BATCH,
           int CW,
           class TD,
           class RC>
-__device__ __forceinline__ void
-    moe_combine_sm100(TD const *task_desc, RC const &runtime_config) {
+__device__ __forceinline__ void moe_combine_sm100(TD const *task_desc,
+                                                  RC const &runtime_config) {
   using namespace mxg;
   constexpr int NCHUNK = H / CW;
   constexpr int NW = CW / 2; // 32-bit words (two columns) a chunk
   constexpr int ROUTED = SLOTS - SHARED;
   static_assert((CW == 8 || CW == 2) && H % 8 == 0 && SLOTS <= 16,
                 "16 B or 4 B chunks, the slots in registers");
-  const unsigned *in = static_cast<const unsigned *>(task_desc->input_ptrs[0]);
-  const float *wt = static_cast<const float *>(task_desc->input_ptrs[1]);
-  const unsigned *res = static_cast<const unsigned *>(task_desc->input_ptrs[2]);
+  unsigned const *in = static_cast<unsigned const *>(task_desc->input_ptrs[0]);
+  float const *wt = static_cast<float const *>(task_desc->input_ptrs[1]);
+  unsigned const *res = static_cast<unsigned const *>(task_desc->input_ptrs[2]);
   unsigned *y = static_cast<unsigned *>(task_desc->output_ptrs[0]);
-  const int nthreads = blockDim.x;
-  const int gid = static_cast<int>(task_desc->task_metadata.ext_bid_x) * nthreads +
-                  threadIdx.x;
+  int const nthreads = blockDim.x;
+  int const gid =
+      static_cast<int>(task_desc->task_metadata.ext_bid_x) * nthreads +
+      threadIdx.x;
   // a chunk's words: one load
-  auto load = [](const unsigned *p, unsigned *w) {
+  auto load = [](unsigned const *p, unsigned *w) {
     if (NW == 4) {
       const uint4 v = *reinterpret_cast<const uint4 *>(p);
       w[0] = v.x;
@@ -1427,8 +1397,8 @@ __device__ __forceinline__ void
   };
 #pragma unroll 1
   for (int u = gid; u < BATCH * NCHUNK; u += G * nthreads) {
-    const int t = u / NCHUNK, c = u % NCHUNK;
-    const unsigned *ir = in + static_cast<size_t>(t) * SLOTS * (H / 2);
+    int const t = u / NCHUNK, c = u % NCHUNK;
+    unsigned const *ir = in + static_cast<size_t>(t) * SLOTS * (H / 2);
     unsigned v[SLOTS][NW], rv[NW];
     float w[SLOTS];
 #pragma unroll
@@ -1447,8 +1417,8 @@ __device__ __forceinline__ void
     for (int s = 0; s < SLOTS; ++s) {
 #pragma unroll
       for (int j = 0; j < NW; ++j) {
-        const float lo = bfround(bf2f(v[s][j] & 0xffff) * w[s]);
-        const float hi = bfround(bf2f(v[s][j] >> 16) * w[s]);
+        float const lo = bfround(bf2f(v[s][j] & 0xffff) * w[s]);
+        float const hi = bfround(bf2f(v[s][j] >> 16) * w[s]);
         if (s < ROUTED) {
           acc[2 * j] += lo;
           acc[2 * j + 1] += hi;
@@ -1496,35 +1466,35 @@ template <int BATCH,
           int G,
           class TD,
           class RC>
-__device__ __forceinline__ void
-    small_linear_sm100(TD const *task_desc, RC const &runtime_config) {
+__device__ __forceinline__ void small_linear_sm100(TD const *task_desc,
+                                                   RC const &runtime_config) {
   using namespace mxg;
   constexpr int NCHUNK = K / 8;
   constexpr int CPL = (NCHUNK + 31) / 32; // chunks a lane
   static_assert(K % 8 == 0, "16 B chunks");
-  const uint4 *x = static_cast<const uint4 *>(task_desc->input_ptrs[0]);
-  const uint4 *w = static_cast<const uint4 *>(task_desc->input_ptrs[1]);
-  const unsigned short *bias =
-      HAS_BIAS ? static_cast<const unsigned short *>(task_desc->input_ptrs[2])
+  uint4 const *x = static_cast<uint4 const *>(task_desc->input_ptrs[0]);
+  uint4 const *w = static_cast<uint4 const *>(task_desc->input_ptrs[1]);
+  unsigned short const *bias =
+      HAS_BIAS ? static_cast<unsigned short const *>(task_desc->input_ptrs[2])
                : nullptr;
   unsigned short *y = static_cast<unsigned short *>(task_desc->output_ptrs[0]);
-  const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
-  const int nwarps = blockDim.x >> 5;
-  const int gw = static_cast<int>(task_desc->task_metadata.ext_bid_x) * nwarps +
-                 warp;
+  int const lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+  int const nwarps = blockDim.x >> 5;
+  int const gw =
+      static_cast<int>(task_desc->task_metadata.ext_bid_x) * nwarps + warp;
 #pragma unroll 1
   for (int u = gw; u < BATCH * ROWS; u += G * nwarps) {
-    const int t = u / ROWS, r = u % ROWS;
-    const uint4 *xr = x + static_cast<size_t>(t) * NCHUNK;
-    const uint4 *wr = w + static_cast<size_t>(r) * NCHUNK;
+    int const t = u / ROWS, r = u % ROWS;
+    uint4 const *xr = x + static_cast<size_t>(t) * NCHUNK;
+    uint4 const *wr = w + static_cast<size_t>(r) * NCHUNK;
     float acc = 0.f;
 #pragma unroll
     for (int i = 0; i < CPL; ++i) {
-      const int c = lane + 32 * i;
+      int const c = lane + 32 * i;
       if (c < NCHUNK) {
         const uint4 xv = xr[c], wv = wr[c];
-        const unsigned *p = reinterpret_cast<const unsigned *>(&xv);
-        const unsigned *q = reinterpret_cast<const unsigned *>(&wv);
+        unsigned const *p = reinterpret_cast<unsigned const *>(&xv);
+        unsigned const *q = reinterpret_cast<unsigned const *>(&wv);
 #pragma unroll
         for (int j = 0; j < 4; ++j) {
           acc += bf2f(p[j] & 0xffff) * bf2f(q[j] & 0xffff) +
@@ -1537,7 +1507,7 @@ __device__ __forceinline__ void
       acc += __shfl_xor_sync(0xffffffffu, acc, off);
     }
     if (lane == 0) {
-      const float b = HAS_BIAS ? bf2f(bias[r]) : 0.f;
+      float const b = HAS_BIAS ? bf2f(bias[r]) : 0.f;
       y[static_cast<size_t>(t) * OSTRIDE + r] = f2bf(acc + b);
     }
   }
@@ -1553,10 +1523,11 @@ __device__ __forceinline__ void
 // all 512 columns waits forever.
 // ---------------------------------------------------------------------------
 template <int TOKEN_INPUT, class TD, class RC>
-__device__ __forceinline__ void
-    tmem_release_sm100(TD const *task_desc, RC const &runtime_config) {
-  int *tok = static_cast<int *>(task_desc->input_ptrs[TOKEN_INPUT]) + blockIdx.x;
-  const int v = *tok;
+__device__ __forceinline__ void tmem_release_sm100(TD const *task_desc,
+                                                   RC const &runtime_config) {
+  int *tok =
+      static_cast<int *>(task_desc->input_ptrs[TOKEN_INPUT]) + blockIdx.x;
+  int const v = *tok;
   if (v < 0) {
     if ((threadIdx.x >> 5) == 0) {
       mxg::tmem_free512(static_cast<unsigned>(v & 0x7fffffff));

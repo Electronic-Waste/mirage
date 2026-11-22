@@ -720,8 +720,8 @@ __device__ __forceinline__ void multitoken_paged_attention_sm100_task_impl(
           // accumulate o (buffer holds only the current m-tile)
           float other_o =
               s_o_buffer[local_idx * 32 * O_FRAGS // 32 threads per local value
-                         + t_idx * O_FRAGS   // corresponding thread
-                         + mma_iter_n * 8    // mma iter n
+                         + t_idx * O_FRAGS        // corresponding thread
+                         + mma_iter_n * 8         // mma iter n
                          + frag_idx];
           o_global = o_global * expf(m_prev - m_global) +
                      other_o * expf(other_m - m_global);

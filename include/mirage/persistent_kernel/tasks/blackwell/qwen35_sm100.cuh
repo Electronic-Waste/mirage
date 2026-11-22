@@ -42,25 +42,26 @@ __device__ __forceinline__ float sigmoid(float x) {
 
 // ---------------------------------------------------------------------------
 // y = (x * rsqrt(mean(x^2) + eps)) * (1 + w), in fp32, rounded to bf16.
-// inputs: [0] x bf16 [BATCH][H]; [1] w bf16 [H]. outputs: [0] y bf16 [BATCH][H].
+// inputs: [0] x bf16 [BATCH][H]; [1] w bf16 [H].
+// outputs: [0] y bf16 [BATCH][H].
 // WIDE 0: a warp per token, lane l holds the 16-byte chunks l, l + 32, ...
 // WIDE 1 (at most a token a task of the wave: small batches): the whole
 // block on one token, a thread a chunk -- a warp alone with a token took
 // 5 us of the layer twice.
 // ---------------------------------------------------------------------------
 template <int BATCH, int H, int G, int EPS_BITS, int WIDE, class TD, class RC>
-__device__ __forceinline__ void
-    norm1p_sm100(TD const *task_desc, RC const &runtime_config) {
+__device__ __forceinline__ void norm1p_sm100(TD const *task_desc,
+                                             RC const &runtime_config) {
   using namespace q35;
-  const uint4 *x = static_cast<const uint4 *>(task_desc->input_ptrs[0]);
-  const uint4 *w = static_cast<const uint4 *>(task_desc->input_ptrs[1]);
+  uint4 const *x = static_cast<uint4 const *>(task_desc->input_ptrs[0]);
+  uint4 const *w = static_cast<uint4 const *>(task_desc->input_ptrs[1]);
   uint4 *y = static_cast<uint4 *>(task_desc->output_ptrs[0]);
-  const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
-  const int nwarps = blockDim.x >> 5;
-  const int task_i = static_cast<int>(task_desc->task_metadata.ext_bid_x);
-  const float eps = __int_as_float(EPS_BITS);
+  int const lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+  int const nwarps = blockDim.x >> 5;
+  int const task_i = static_cast<int>(task_desc->task_metadata.ext_bid_x);
+  float const eps = __int_as_float(EPS_BITS);
   // one chunk (8 values): its sum of squares
-  auto squares = [](const uint4 &v) {
+  auto squares = [](uint4 const &v) {
     const unsigned *p = reinterpret_cast<const unsigned *>(&v);
     float ss = 0.f;
 #pragma unroll
@@ -70,7 +71,7 @@ __device__ __forceinline__ void
     }
     return ss;
   };
-  auto scaled = [](const uint4 &v, const uint4 &wv, float rs) {
+  auto scaled = [](uint4 const &v, uint4 const &wv, float rs) {
     const unsigned *p = reinterpret_cast<const unsigned *>(&v);
     const unsigned *q = reinterpret_cast<const unsigned *>(&wv);
     uint4 o;
@@ -86,14 +87,15 @@ __device__ __forceinline__ void
   };
   if (WIDE) {
     constexpr int CPT = H / 2048; // chunks of 8 values a thread
-    static_assert(H % 2048 == 0 && CPT >= 1 && CPT <= 4, "H / 2048 chunks a thread");
+    static_assert(H % 2048 == 0 && CPT >= 1 && CPT <= 4,
+                  "H / 2048 chunks a thread");
     extern __shared__ char shared_memory[];
     float *red = reinterpret_cast<float *>(
         (reinterpret_cast<uintptr_t>(shared_memory) + 15) / 16 * 16);
-    const int tid = threadIdx.x, nthreads = blockDim.x;
+    int const tid = threadIdx.x, nthreads = blockDim.x;
 #pragma unroll 1
     for (int t = task_i; t < BATCH; t += G) {
-      const uint4 *xr = x + static_cast<size_t>(t) * (H / 8);
+      uint4 const *xr = x + static_cast<size_t>(t) * (H / 8);
       uint4 *yr = y + static_cast<size_t>(t) * (H / 8);
       uint4 v[CPT], wv[CPT];
       float ss = 0.f;
@@ -113,7 +115,7 @@ __device__ __forceinline__ void
       for (int i = 0; i < 8; ++i) {
         tot += red[i];
       }
-      const float rs = rsqrtf(tot / H + eps);
+      float const rs = rsqrtf(tot / H + eps);
 #pragma unroll
       for (int i = 0; i < CPT; ++i) {
         yr[tid + nthreads * i] = scaled(v[i], wv[i], rs);
@@ -124,10 +126,10 @@ __device__ __forceinline__ void
   }
   constexpr int CPL = H / 256; // chunks of 8 values a lane
   static_assert(H % 256 == 0 && CPL >= 1 && CPL <= 8, "H / 256 chunks a lane");
-  const int gw = task_i * nwarps + warp;
+  int const gw = task_i * nwarps + warp;
 #pragma unroll 1
   for (int t = gw; t < BATCH; t += G * nwarps) {
-    const uint4 *xr = x + static_cast<size_t>(t) * (H / 8);
+    uint4 const *xr = x + static_cast<size_t>(t) * (H / 8);
     uint4 *yr = y + static_cast<size_t>(t) * (H / 8);
     uint4 v[CPL];
     float ss = 0.f;
@@ -136,7 +138,7 @@ __device__ __forceinline__ void
       v[i] = xr[lane + 32 * i];
       ss += squares(v[i]);
     }
-    const float rs = rsqrtf(warp_sum(ss) / H + eps);
+    float const rs = rsqrtf(warp_sum(ss) / H + eps);
 #pragma unroll
     for (int i = 0; i < CPL; ++i) {
       yr[lane + 32 * i] = scaled(v[i], w[lane + 32 * i], rs);
@@ -161,54 +163,55 @@ template <int BATCH,
           int EPS_BITS,
           class TD,
           class RC>
-__device__ __forceinline__ void
-    qsa_prep_sm100(TD const *task_desc, RC const &runtime_config) {
+__device__ __forceinline__ void qsa_prep_sm100(TD const *task_desc,
+                                               RC const &runtime_config) {
   using namespace q35;
-  constexpr int HPK = QPK + 2;       // heads of a KV head in the layout
-  constexpr int NH = NKV * HPK;      // rows of a token
+  constexpr int HPK = QPK + 2;  // heads of a KV head in the layout
+  constexpr int NH = NKV * HPK; // rows of a token
   constexpr int CPL = HD / 256;
-  static_assert(HD % 256 == 0 && CPL >= 1 && CPL <= 4, "HD / 256 chunks a lane");
-  const uint4 *proj = static_cast<const uint4 *>(task_desc->input_ptrs[0]);
-  const uint4 *wq = static_cast<const uint4 *>(task_desc->input_ptrs[1]);
-  const uint4 *wk = static_cast<const uint4 *>(task_desc->input_ptrs[2]);
+  static_assert(HD % 256 == 0 && CPL >= 1 && CPL <= 4,
+                "HD / 256 chunks a lane");
+  uint4 const *proj = static_cast<uint4 const *>(task_desc->input_ptrs[0]);
+  uint4 const *wq = static_cast<uint4 const *>(task_desc->input_ptrs[1]);
+  uint4 const *wk = static_cast<uint4 const *>(task_desc->input_ptrs[2]);
   uint4 *out = static_cast<uint4 *>(task_desc->output_ptrs[0]);
-  const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
-  const int nwarps = blockDim.x >> 5;
-  const int gw = static_cast<int>(task_desc->task_metadata.ext_bid_x) * nwarps +
-                 warp;
-  const float eps = __int_as_float(EPS_BITS);
+  int const lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+  int const nwarps = blockDim.x >> 5;
+  int const gw =
+      static_cast<int>(task_desc->task_metadata.ext_bid_x) * nwarps + warp;
+  float const eps = __int_as_float(EPS_BITS);
 #pragma unroll 1
   for (int u = gw; u < BATCH * NH; u += G * nwarps) {
-    const int t = u / NH, h = u % NH, role = h % HPK; // < QPK q, QPK k, else v
-    const uint4 *xr = proj + (static_cast<size_t>(t) * PW + h * HD) / 8;
+    int const t = u / NH, h = u % NH, role = h % HPK; // < QPK q, QPK k, else v
+    uint4 const *xr = proj + (static_cast<size_t>(t) * PW + h * HD) / 8;
     uint4 *yr = out + (static_cast<size_t>(t) * NH + h) * (HD / 8);
     uint4 v[CPL];
     float ss = 0.f;
 #pragma unroll
     for (int i = 0; i < CPL; ++i) {
       v[i] = xr[lane + 32 * i];
-      const unsigned *p = reinterpret_cast<const unsigned *>(&v[i]);
+      unsigned const *p = reinterpret_cast<unsigned const *>(&v[i]);
 #pragma unroll
       for (int j = 0; j < 4; ++j) {
-        const float a = bf2f(p[j] & 0xffff), b = bf2f(p[j] >> 16);
+        float const a = bf2f(p[j] & 0xffff), b = bf2f(p[j] >> 16);
         ss += a * a + b * b;
       }
     }
-    const float rs = rsqrtf(warp_sum(ss) / HD + eps);
-    const uint4 *wn = role == QPK ? wk : wq;
+    float const rs = rsqrtf(warp_sum(ss) / HD + eps);
+    uint4 const *wn = role == QPK ? wk : wq;
 #pragma unroll
     for (int i = 0; i < CPL; ++i) {
       uint4 o = v[i];
       if (role <= QPK) {
         const uint4 wv = wn[lane + 32 * i];
-        const unsigned *p = reinterpret_cast<const unsigned *>(&v[i]);
-        const unsigned *q = reinterpret_cast<const unsigned *>(&wv);
+        unsigned const *p = reinterpret_cast<unsigned const *>(&v[i]);
+        unsigned const *q = reinterpret_cast<unsigned const *>(&wv);
         unsigned *r = reinterpret_cast<unsigned *>(&o);
 #pragma unroll
         for (int j = 0; j < 4; ++j) {
-          const float a =
+          float const a =
               (bf2f(p[j] & 0xffff) * rs) * (1.f + bf2f(q[j] & 0xffff));
-          const float b = (bf2f(p[j] >> 16) * rs) * (1.f + bf2f(q[j] >> 16));
+          float const b = (bf2f(p[j] >> 16) * rs) * (1.f + bf2f(q[j] >> 16));
           r[j] = static_cast<unsigned>(f2bf(a)) |
                  (static_cast<unsigned>(f2bf(b)) << 16);
         }
@@ -227,43 +230,45 @@ __device__ __forceinline__ void
 // after another, each waiting for its loads: 7.5 us a token).
 // ---------------------------------------------------------------------------
 template <int BATCH, int W, int PW, int GOFF, int G, class TD, class RC>
-__device__ __forceinline__ void
-    gate_mul_sm100(TD const *task_desc, RC const &runtime_config) {
+__device__ __forceinline__ void gate_mul_sm100(TD const *task_desc,
+                                               RC const &runtime_config) {
   using namespace q35;
   constexpr int NCHUNK = W / 8;
   static_assert(W % 8 == 0 && GOFF % 8 == 0 && PW % 8 == 0, "16 B chunks");
-  const uint4 *a = static_cast<const uint4 *>(task_desc->input_ptrs[0]);
-  const uint4 *proj = static_cast<const uint4 *>(task_desc->input_ptrs[1]);
+  uint4 const *a = static_cast<uint4 const *>(task_desc->input_ptrs[0]);
+  uint4 const *proj = static_cast<uint4 const *>(task_desc->input_ptrs[1]);
   uint4 *y = static_cast<uint4 *>(task_desc->output_ptrs[0]);
-  const int nthreads = blockDim.x;
-  const int stride = G * nthreads;
-  const int gid = static_cast<int>(task_desc->task_metadata.ext_bid_x) * nthreads +
-                  threadIdx.x;
+  int const nthreads = blockDim.x;
+  int const stride = G * nthreads;
+  int const gid =
+      static_cast<int>(task_desc->task_metadata.ext_bid_x) * nthreads +
+      threadIdx.x;
 #pragma unroll 1
   for (int u0 = gid; u0 < BATCH * NCHUNK; u0 += 2 * stride) {
     uint4 av[2], gv[2];
 #pragma unroll
     for (int i = 0; i < 2; ++i) {
-      const int u = u0 + i * stride;
+      int const u = u0 + i * stride;
       if (u < BATCH * NCHUNK) {
-        const int t = u / NCHUNK, c = u % NCHUNK;
+        int const t = u / NCHUNK, c = u % NCHUNK;
         av[i] = a[static_cast<size_t>(t) * NCHUNK + c];
         gv[i] = proj[(static_cast<size_t>(t) * PW + GOFF) / 8 + c];
       }
     }
 #pragma unroll
     for (int i = 0; i < 2; ++i) {
-      const int u = u0 + i * stride;
+      int const u = u0 + i * stride;
       if (u < BATCH * NCHUNK) {
-        const unsigned *p = reinterpret_cast<const unsigned *>(&av[i]);
-        const unsigned *q = reinterpret_cast<const unsigned *>(&gv[i]);
+        unsigned const *p = reinterpret_cast<unsigned const *>(&av[i]);
+        unsigned const *q = reinterpret_cast<unsigned const *>(&gv[i]);
         uint4 o;
         unsigned *r = reinterpret_cast<unsigned *>(&o);
 #pragma unroll
         for (int j = 0; j < 4; ++j) {
-          const float lo =
+          float const lo =
               bf2f(p[j] & 0xffff) * bfround(sigmoid(bf2f(q[j] & 0xffff)));
-          const float hi = bf2f(p[j] >> 16) * bfround(sigmoid(bf2f(q[j] >> 16)));
+          float const hi =
+              bf2f(p[j] >> 16) * bfround(sigmoid(bf2f(q[j] >> 16)));
           r[j] = static_cast<unsigned>(f2bf(lo)) |
                  (static_cast<unsigned>(f2bf(hi)) << 16);
         }
@@ -308,8 +313,8 @@ template <int BATCH,
           int XMAP,
           class TD,
           class RC>
-__device__ __forceinline__ void
-    gdn_step_sm100(TD const *task_desc, RC const &runtime_config) {
+__device__ __forceinline__ void gdn_step_sm100(TD const *task_desc,
+                                               RC const &runtime_config) {
   using namespace q35;
   using namespace mxg;
   constexpr int NVH = 2 * NKH;
@@ -318,16 +323,18 @@ __device__ __forceinline__ void
   constexpr int RPW = D / 8; // state rows a warp
   static_assert(D == 128, "8 warps of 16 rows, 32 lanes of 4 columns");
   static_assert(PW >= C + NVH * D + 2 * NVH && PW % 4 == 0, "proj width");
-  const unsigned short *proj =
-      static_cast<const unsigned short *>(task_desc->input_ptrs[0]);
-  const unsigned short *convw =
-      static_cast<const unsigned short *>(task_desc->input_ptrs[1]);
-  unsigned short *cstate = static_cast<unsigned short *>(task_desc->input_ptrs[2]);
+  unsigned short const *proj =
+      static_cast<unsigned short const *>(task_desc->input_ptrs[0]);
+  unsigned short const *convw =
+      static_cast<unsigned short const *>(task_desc->input_ptrs[1]);
+  unsigned short *cstate =
+      static_cast<unsigned short *>(task_desc->input_ptrs[2]);
   float *sglob = static_cast<float *>(task_desc->input_ptrs[3]);
-  const float *par = static_cast<const float *>(task_desc->input_ptrs[4]);
-  unsigned short *out = static_cast<unsigned short *>(task_desc->output_ptrs[0]);
-  const int task_i = static_cast<int>(task_desc->task_metadata.ext_bid_x);
-  const float eps = __int_as_float(EPS_BITS);
+  float const *par = static_cast<float const *>(task_desc->input_ptrs[4]);
+  unsigned short *out =
+      static_cast<unsigned short *>(task_desc->output_ptrs[0]);
+  int const task_i = static_cast<int>(task_desc->task_metadata.ext_bid_x);
+  float const eps = __int_as_float(EPS_BITS);
 
   extern __shared__ char shared_memory[];
   char *base = reinterpret_cast<char *>(
@@ -339,14 +346,14 @@ __device__ __forceinline__ void
   float *pm = vv + D;                         // [8 warps][2][D] partial sums
   float *red = pm + 16 * D;                   // [16] reductions
 
-  const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
-  const int half = tid >> 7, j = tid & 127; // conv: q + v (half 0), k (half 1)
+  int const tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
+  int const half = tid >> 7, j = tid & 127; // conv: q + v (half 0), k (half 1)
 #pragma unroll 1
   for (int u = task_i; u < BATCH * NVH; u += G) {
-    const int t = u / NVH, v = u % NVH, hk = v / 2;
+    int const t = u / NVH, v = u % NVH, hk = v / 2;
     int rid, pos = 0;
     if (XMAP) {
-      const int *xm = static_cast<const int *>(task_desc->input_ptrs[5]);
+      int const *xm = static_cast<int const *>(task_desc->input_ptrs[5]);
       rid = xm[2 * t];
       pos = xm[2 * t + 1];
     } else {
@@ -358,24 +365,24 @@ __device__ __forceinline__ void
     if (rid < 0) {
       continue; // an empty request slot (uniform over the block)
     }
-    const bool fresh = pos == 0;
-    const unsigned short *pr = proj + static_cast<size_t>(t) * PW;
+    bool const fresh = pos == 0;
+    unsigned short const *pr = proj + static_cast<size_t>(t) * PW;
     unsigned short *cs = cstate + static_cast<size_t>(rid) * 4 * C;
     float *sg = sglob + (static_cast<size_t>(rid) * NVH + v) * D * D;
-    const int sw = pos & 3, s0 = (pos + 1) & 3, s1 = (pos + 2) & 3,
+    int const sw = pos & 3, s0 = (pos + 1) & 3, s1 = (pos + 2) & 3,
               s2 = (pos + 3) & 3;
 
     // ---- this thread's inputs first: their loads are in flight while the
     // state's copies are issued
-    const int c0 = (half * NKH + hk) * D + j;     // q or k channel
-    const int c1 = 2 * NKH * D + v * D + j;       // value channel (half 0)
-    const unsigned short xin0 = pr[c0];
-    const uint2 w0 = reinterpret_cast<const uint2 *>(convw)[c0];
+    int const c0 = (half * NKH + hk) * D + j; // q or k channel
+    int const c1 = 2 * NKH * D + v * D + j;   // value channel (half 0)
+    unsigned short const xin0 = pr[c0];
+    const uint2 w0 = reinterpret_cast<uint2 const *>(convw)[c0];
     unsigned short xin1 = 0;
     uint2 w1 = make_uint2(0, 0);
     if (half == 0) {
       xin1 = pr[c1];
-      w1 = reinterpret_cast<const uint2 *>(convw)[c1];
+      w1 = reinterpret_cast<uint2 const *>(convw)[c1];
     }
     unsigned short h0[3] = {0, 0, 0}, h1[3] = {0, 0, 0};
     if (!fresh) {
@@ -388,26 +395,26 @@ __device__ __forceinline__ void
         h1[2] = cs[s2 * C + c1];
       }
     }
-    const unsigned short bg_raw = pr[C + NVH * D + v];
-    const unsigned short ag_raw = pr[C + NVH * D + NVH + v];
-    const float p_a = par[v], p_dt = par[NVH + v];
+    unsigned short const bg_raw = pr[C + NVH * D + v];
+    unsigned short const ag_raw = pr[C + NVH * D + NVH + v];
+    float const p_a = par[v], p_dt = par[NVH + v];
     uint2 zraw = make_uint2(0, 0);
     float4 wn = make_float4(0.f, 0.f, 0.f, 0.f);
     if (warp == 0) {
-      zraw = *reinterpret_cast<const uint2 *>(pr + C + v * D + 4 * lane);
-      wn = *reinterpret_cast<const float4 *>(par + 2 * NVH + 4 * lane);
+      zraw = *reinterpret_cast<uint2 const *>(pr + C + v * D + 4 * lane);
+      wn = *reinterpret_cast<float4 const *>(par + 2 * NVH + 4 * lane);
     }
     if (!fresh) {
 #pragma unroll 1
       for (int i = tid; i < SBYTES / 16; i += blockDim.x) {
         cp_async16(reinterpret_cast<char *>(S) + 16 * i,
-                   reinterpret_cast<const char *>(sg) + 16 * i);
+                   reinterpret_cast<char const *>(sg) + 16 * i);
       }
       asm volatile("cp.async.commit_group;" ::: "memory");
     }
     // (nothing that uses a loaded value before here: the warp would wait for
     // it with the copies still to issue)
-    const float bg = bf2f(bg_raw), ag = bf2f(ag_raw);
+    float const bg = bf2f(bg_raw), ag = bf2f(ag_raw);
 
     // ---- causal conv + SiLU: taps w0 x(t-3), w1 x(t-2), w2 x(t-1), w3 x(t)
     float qk, vcol = 0.f;
@@ -451,33 +458,34 @@ __device__ __forceinline__ void
     }
     __syncthreads();
     {
-      const float tot = red[4 * half] + red[4 * half + 1] + red[4 * half + 2] +
+      float const tot = red[4 * half] + red[4 * half + 1] + red[4 * half + 2] +
                         red[4 * half + 3];
-      const float rs = rsqrtf(tot + 1e-6f);
+      float const rs = rsqrtf(tot + 1e-6f);
       if (half == 0) {
         qn[j] = (qk * rs) * 0.08838834764831845f; // 1 / sqrt(128)
       } else {
         kn[j] = qk * rs;
       }
     }
-    const float beta = bfround(sigmoid(bg));
-    const float sp_in = ag + p_dt;
-    const float sp = sp_in > 20.f ? sp_in : log1pf(__expf(sp_in));
-    const float decay = __expf(p_a * sp);
+    float const beta = bfround(sigmoid(bg));
+    float const sp_in = ag + p_dt;
+    float const sp = sp_in > 20.f ? sp_in : log1pf(__expf(sp_in));
+    float const decay = __expf(p_a * sp);
     if (!fresh) {
       asm volatile("cp.async.wait_group 0;" ::: "memory");
     }
     __syncthreads();
     // ---- k . q, and the partial S^T k, S^T q of this warp's rows
     if (half == 0) {
-      const float kq = warp_sum(qn[j] * kn[j]);
+      float const kq = warp_sum(qn[j] * kn[j]);
       if (lane == 0) {
         red[8 + warp] = kq;
       }
     }
-    const float4 *row = reinterpret_cast<const float4 *>(S + (RPW * warp) * D) + lane;
-    const float4 *kn4 = reinterpret_cast<const float4 *>(kn) + (RPW / 4) * warp;
-    const float4 *qn4 = reinterpret_cast<const float4 *>(qn) + (RPW / 4) * warp;
+    float4 const *row =
+        reinterpret_cast<float4 const *>(S + (RPW * warp) * D) + lane;
+    float4 const *kn4 = reinterpret_cast<float4 const *>(kn) + (RPW / 4) * warp;
+    float4 const *qn4 = reinterpret_cast<float4 const *>(qn) + (RPW / 4) * warp;
     {
       float4 a = make_float4(0.f, 0.f, 0.f, 0.f), b = a;
       if (!fresh) {
@@ -487,8 +495,14 @@ __device__ __forceinline__ void
 #pragma unroll
           for (int q = 0; q < 4; ++q) {
             const float4 s = row[(4 * r4 + q) * (D / 4)];
-            const float kk = q == 0 ? kv.x : q == 1 ? kv.y : q == 2 ? kv.z : kv.w;
-            const float qq = q == 0 ? qv.x : q == 1 ? qv.y : q == 2 ? qv.z : qv.w;
+            float const kk = q == 0   ? kv.x
+                             : q == 1 ? kv.y
+                             : q == 2 ? kv.z
+                                      : kv.w;
+            float const qq = q == 0   ? qv.x
+                             : q == 1 ? qv.y
+                             : q == 2 ? qv.z
+                                      : qv.w;
             a.x += s.x * kk;
             a.y += s.y * kk;
             a.z += s.z * kk;
@@ -507,8 +521,9 @@ __device__ __forceinline__ void
     float4 m1 = make_float4(0.f, 0.f, 0.f, 0.f), m2 = m1;
 #pragma unroll
     for (int w = 0; w < 8; ++w) {
-      const float4 a = reinterpret_cast<const float4 *>(pm + (2 * w) * D)[lane];
-      const float4 b = reinterpret_cast<const float4 *>(pm + (2 * w + 1) * D)[lane];
+      const float4 a = reinterpret_cast<float4 const *>(pm + (2 * w) * D)[lane];
+      const float4 b =
+          reinterpret_cast<float4 const *>(pm + (2 * w + 1) * D)[lane];
       m1.x += a.x;
       m1.y += a.y;
       m1.z += a.z;
@@ -518,8 +533,8 @@ __device__ __forceinline__ void
       m2.z += b.z;
       m2.w += b.w;
     }
-    const float kq = red[8] + red[9] + red[10] + red[11];
-    const float4 vc = reinterpret_cast<const float4 *>(vv)[lane];
+    float const kq = red[8] + red[9] + red[10] + red[11];
+    const float4 vc = reinterpret_cast<float4 const *>(vv)[lane];
     float4 dl;
     dl.x = (vc.x - decay * m1.x) * beta;
     dl.y = (vc.y - decay * m1.y) * beta;
@@ -537,7 +552,7 @@ __device__ __forceinline__ void
           if (!fresh) {
             s = row[(4 * r4 + q) * (D / 4)];
           }
-          const float kk = q == 0 ? kv.x : q == 1 ? kv.y : q == 2 ? kv.z : kv.w;
+          float const kk = q == 0 ? kv.x : q == 1 ? kv.y : q == 2 ? kv.z : kv.w;
           s.x = decay * s.x + kk * dl.x;
           s.y = decay * s.y + kk * dl.y;
           s.z = decay * s.z + kk * dl.z;
@@ -553,20 +568,22 @@ __device__ __forceinline__ void
       o.y = bfround(decay * m2.y + dl.y * kq);
       o.z = bfround(decay * m2.z + dl.z * kq);
       o.w = bfround(decay * m2.w + dl.w * kq);
-      const float tot = warp_sum(o.x * o.x + o.y * o.y + o.z * o.z + o.w * o.w);
-      const float rn = rsqrtf(tot / D + eps);
-      const float z[4] = {bf2f(zraw.x & 0xffff), bf2f(zraw.x >> 16),
-                          bf2f(zraw.y & 0xffff), bf2f(zraw.y >> 16)};
-      const float ov[4] = {o.x, o.y, o.z, o.w};
-      const float wv[4] = {wn.x, wn.y, wn.z, wn.w};
+      float const tot = warp_sum(o.x * o.x + o.y * o.y + o.z * o.z + o.w * o.w);
+      float const rn = rsqrtf(tot / D + eps);
+      float const z[4] = {bf2f(zraw.x & 0xffff),
+                          bf2f(zraw.x >> 16),
+                          bf2f(zraw.y & 0xffff),
+                          bf2f(zraw.y >> 16)};
+      float const ov[4] = {o.x, o.y, o.z, o.w};
+      float const wv[4] = {wn.x, wn.y, wn.z, wn.w};
       unsigned short y[4];
 #pragma unroll
       for (int q = 0; q < 4; ++q) {
-        const float n = bfround(ov[q] * rn);
+        float const n = bfround(ov[q] * rn);
         y[q] = f2bf(bfround(wv[q] * n) * silu(z[q]));
       }
-      *reinterpret_cast<uint2 *>(out + static_cast<size_t>(t) * NVH * D + v * D +
-                                 4 * lane) =
+      *reinterpret_cast<uint2 *>(out + static_cast<size_t>(t) * NVH * D +
+                                 v * D + 4 * lane) =
           make_uint2(y[0] | (static_cast<unsigned>(y[1]) << 16),
                      y[2] | (static_cast<unsigned>(y[3]) << 16));
     }

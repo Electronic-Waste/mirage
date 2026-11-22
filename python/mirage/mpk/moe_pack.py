@@ -93,8 +93,7 @@ def unpack_mxfp4(blocks: torch.Tensor, scales: torch.Tensor) -> torch.Tensor:
 def interleave_gate_up(w: torch.Tensor) -> torch.Tensor:
     """[E, 2 I, ...] with the gate rows first -> rows (gate 0, up 0, gate 1,
     ...), the order moe_gemm_layer's activation expects."""
-    e, r = w.shape[0], w.shape[1]
-    half = r // 2
+    half = w.shape[1] // 2
     return torch.stack([w[:, :half], w[:, half:]], dim=2).reshape(w.shape)
 
 
