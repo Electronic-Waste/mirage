@@ -1167,6 +1167,11 @@ __device__ __forceinline__ void
 #pragma unroll 1
         for (int kb = kb0; kb < kb1; ++kb, ++gs) {
           const int s = gs % STG;
+#ifdef MXG_TRACE
+          if (j == 0 && kb < 24) {
+            mxg_tr[64 + 8 * kb + 0] = mxg_now(); // asks for the stage
+          }
+#endif
           if (gs >= STG) {
             mbar_wait(&x_empty[s], ((gs / STG) - 1) & 1);
           }
@@ -1175,6 +1180,11 @@ __device__ __forceinline__ void
                     src + static_cast<size_t>(kb) * ABLK,
                     ABLK,
                     &x_full[s]);
+#ifdef MXG_TRACE
+          if (j == 0 && kb < 24) {
+            mxg_tr[64 + 8 * kb + 1] = mxg_now(); // its copy is out
+          }
+#endif
         }
       }
     }
