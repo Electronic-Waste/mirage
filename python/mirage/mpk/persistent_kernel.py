@@ -2396,10 +2396,25 @@ class PersistentKernel:
         assert weight.dim(0) == batch
         assert route_list.dim(0) == e + shared and route_list.dim(1) == batch
         assert route_meta.dim(0) == 1 + cap + e + shared
-        self.ext_layer("moe_route_sm100", [logits],
-                       [weight, route_list, route_meta], (1, 1, 1),
+        # a warp a token: one task up to 15 tokens, then the tokens over as
+        # many tasks as there are eights of them, with counters of the
+        # experts that the tasks share (zeros between the waves; one tensor
+        # for all the route layers of a shape: they run one after the other)
+        g = 1 if batch < 16 else min(self.num_workers, (batch + 7) // 8)
+        inputs = [logits]
+        if g > 1:
+            if not hasattr(self, "_route_counts"):
+                self._route_counts = {}
+            key = e + shared
+            if key not in self._route_counts:
+                t = torch.zeros(key + 1, dtype=torch.int32, device="cuda")
+                self._route_counts[key] = (t, self.attach_input(
+                    torch_tensor=t, name=f"moe_route_counts_{key}"))
+            inputs.append(self._route_counts[key][1])
+        self.ext_layer("moe_route_sm100", inputs,
+                       [weight, route_list, route_meta], (g, 1, 1),
                        [batch, e, slots - shared, nt, shared, cap,
-                        logits.dim(1)])
+                        logits.dim(1), g])
 
     def moe_gemm_layer(
         self,

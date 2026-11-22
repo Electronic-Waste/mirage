@@ -323,6 +323,11 @@ __device__ __forceinline__ void rows_sync() {
 // pairs, [1 ..] the pairs (expert << 16) | pass in expert order,
 // [1 + CAP + e] the token count of expert e.
 // One warp per token: every lane holds E / 32 logits.
+// G > 1: the wave's G tasks share the tokens (one task took 5 us for every
+// eight tokens: two thirds of a millisecond a layer at batch 1024). The
+// experts' counters are then global -- input [1], int32 [E + SHARED + 1],
+// zeros between waves; its last element counts the tasks that are through
+// their tokens -- and task 0 waits for the others before it writes the plan.
 // ---------------------------------------------------------------------------
 template <int BATCH,
           int E,
@@ -331,6 +336,7 @@ template <int BATCH,
           int SHARED,
           int CAP,
           int LSTRIDE,
+          int G,
           class TD,
           class RC>
 __device__ __forceinline__ void
@@ -347,16 +353,21 @@ __device__ __forceinline__ void
   int *meta = static_cast<int *>(task_desc->output_ptrs[2]);
 
   extern __shared__ char shared_memory[];
-  int *cnt = reinterpret_cast<int *>(
-      (reinterpret_cast<uintptr_t>(shared_memory) + 15) / 16 * 16);
   const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
   const int nwarps = blockDim.x >> 5;
-  for (int i = tid; i < E_TOT; i += blockDim.x) {
-    cnt[i] = 0;
+  const int task_i = static_cast<int>(task_desc->task_metadata.ext_bid_x);
+  int *cnt = G > 1 ? static_cast<int *>(task_desc->input_ptrs[1])
+                   : reinterpret_cast<int *>(
+                         (reinterpret_cast<uintptr_t>(shared_memory) + 15) /
+                         16 * 16);
+  if (G == 1) {
+    for (int i = tid; i < E_TOT; i += blockDim.x) {
+      cnt[i] = 0;
+    }
+    __syncthreads();
   }
-  __syncthreads();
 
-  for (int t = warp; t < BATCH; t += nwarps) {
+  for (int t = task_i * nwarps + warp; t < BATCH; t += G * nwarps) {
     float v[VPL];
 #pragma unroll
     for (int j = 0; j < VPL; ++j) {
@@ -415,6 +426,20 @@ __device__ __forceinline__ void
     }
   }
   __syncthreads();
+  if (G > 1) {
+    if (tid == 0) {
+      __threadfence();
+      atomicAdd(&cnt[E_TOT], 1);
+    }
+    if (task_i != 0) {
+      return;
+    }
+    if (tid == 0) {
+      while (*reinterpret_cast<volatile int *>(&cnt[E_TOT]) != G) {
+      }
+    }
+    __syncthreads();
+  }
 
   if (warp == 0) {
     int base = 0;
@@ -423,7 +448,10 @@ __device__ __forceinline__ void
       const int e = e0 + lane;
       int c = 0;
       if (e < E) {
-        c = cnt[e];
+        c = *reinterpret_cast<volatile int *>(&cnt[e]);
+        if (G > 1) {
+          cnt[e] = 0; // (for the next wave)
+        }
       } else if (e < E_TOT) {
         c = BATCH;
       }
@@ -447,6 +475,9 @@ __device__ __forceinline__ void
     }
     if (lane == 0) {
       meta[0] = base;
+      if (G > 1) {
+        cnt[E_TOT] = 0;
+      }
     }
   }
 }
