@@ -52,6 +52,9 @@ def main():
         limit, alpha, off = float("inf"), 1.0, 0.0
 
     num_workers, num_schedulers = mirage.get_configurations_from_gpu(0)
+    if os.environ.get("TEST_WORKERS"):  # "<workers>,<schedulers>"
+        num_workers, num_schedulers = (
+            int(v) for v in os.environ["TEST_WORKERS"].split(","))
     params = PersistentKernel.get_default_init_parameters()
     params.update(test_mode=True, num_workers=num_workers,
                   num_local_schedulers=num_schedulers,
@@ -145,6 +148,13 @@ def main():
         input=d_x2, weight=pk.attach_input(moe_pack.pack_bf16_tiles(wd), name="w_dense"),
         output=d_yd, rows=DR, bias=pk.attach_input(bd, name="b_dense"),
         residual=pk.attach_input(rd, name="r_dense"), tmem=d_tok)
+    # ---- a small linear layer summed by threads
+    ws = (torch.randn(40, H, device=dev) * 0.05).to(bf)
+    bs = (torch.randn(40, device=dev) * 0.2).to(bf)
+    ys = torch.zeros(B, 48, dtype=bf, device=dev)
+    pk.small_linear_layer(input=d_x2, weight=pk.attach_input(ws, name="w_small"),
+                          bias=pk.attach_input(bs, name="b_small"),
+                          output=pk.attach_input(ys, name="y_small"))
     if held:
         pk.tmem_release_layer([d_comb, d_yd], d_tok,
                               pk.attach_input(tm_done, name="tmem_done"))
@@ -227,6 +237,8 @@ def main():
     yd_ref = bfr(bfr(x.float() @ wd[0].float().T + bd.float()) +
                  rd.float()[:, :DR])
     check("dense + bias + residual", yd[:, :DR], yd_ref, 0.02)
+    check("small linear", ys[:, :40],
+          bfr(x.float() @ ws.float().T + bs.float()), 0.02)
     if float(yd[:, DR:].abs().max()) != 0:
         ok = False
         print("[dense] FAILED: wrote past its rows")

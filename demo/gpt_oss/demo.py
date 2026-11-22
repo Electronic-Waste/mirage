@@ -128,6 +128,17 @@ if __name__ == "__main__":
         }
 
         num_workers, num_schedulers = mi.get_configurations_from_gpu(0)
+        # The task graph is queued once an iteration, so the schedulers have
+        # little to do: on a 148-SM GPU 144 workers and 16 schedulers (4
+        # CTAs) instead of 128 and 64 (GPT-OSS at batch 16: 865 -> 633 ms;
+        # with 4 schedulers the queueing itself slows batch 1 down).
+        if torch.cuda.get_device_properties(0).multi_processor_count >= 148:
+            num_workers, num_schedulers = 144, 16
+        # Benchmark hook: MPK_BENCH_WORKERS="<workers>,<schedulers>" overrides
+        # the split of the GPU's SMs (schedulers in blocks of 4 a CTA).
+        if os.environ.get("MPK_BENCH_WORKERS"):
+            num_workers, num_schedulers = (
+                int(v) for v in os.environ["MPK_BENCH_WORKERS"].split(","))
         # Benchmark hook: MPK_BENCH_PROFILE names a .npy file that receives the
         # raw profiler buffer (the built-in exporters are too slow for a whole
         # generation).

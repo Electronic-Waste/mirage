@@ -138,10 +138,10 @@ class Qwen35Builder(GraphBuilder):
         self._keep.append(tensor)
         return self.mpk.attach_input(torch_tensor=tensor, name=name)
 
-    def _pad_rows(self, w: torch.Tensor, rows: int) -> torch.Tensor:
-        if w.shape[0] == rows:
-            return w
-        return torch.cat([w, w.new_zeros(rows - w.shape[0], w.shape[1])], dim=0)
+    def _dense(self, weight: torch.Tensor, name: str):
+        """A linear layer's weight [rows, K] as dense_gemm_layer's tiles."""
+        return self._attach(
+            moe_pack.pack_bf16_tiles(weight.to("cuda")[None]), name)
 
     def _gdn_weights(self, sd, p, i):
         """in_proj_qkv, in_proj_z, in_proj_b, in_proj_a as one projection
@@ -150,7 +150,6 @@ class Qwen35Builder(GraphBuilder):
         w = torch.cat([sd[la + "in_proj_qkv.weight"], sd[la + "in_proj_z.weight"],
                        sd[la + "in_proj_b.weight"], sd[la + "in_proj_a.weight"]],
                       dim=0)
-        w = self._pad_rows(w, self.gdn_pw)
         par = torch.cat([-sd[la + "A_log"].float().exp(),
                          sd[la + "dt_bias"].float(),
                          sd[la + "norm.weight"].float()]).contiguous()
@@ -160,13 +159,16 @@ class Qwen35Builder(GraphBuilder):
                                  dtype=torch.bfloat16, device="cuda")
         state = torch.zeros(self.num_requests, nvh, self.gdn_dim, self.gdn_dim,
                             dtype=torch.float32, device="cuda")
-        return (self._attach(w, f"layer_{i}_gdn_proj"),
+        if getattr(self, "debug", None) is not None:
+            self.debug[f"gdn_state_{i}"] = state
+            self.debug[f"conv_state_{i}"] = conv_state
+        return (self._dense(w, f"layer_{i}_gdn_proj"),
                 self._attach(sd[la + "conv1d.weight"].reshape(channels, 4),
                              f"layer_{i}_gdn_conv"),
                 self._attach(conv_state, f"layer_{i}_gdn_conv_state"),
                 self._attach(state, f"layer_{i}_gdn_state"),
                 self._attach(par, f"layer_{i}_gdn_params"),
-                self._attach(sd[la + "out_proj.weight"], f"layer_{i}_gdn_out"))
+                self._dense(sd[la + "out_proj.weight"], f"layer_{i}_gdn_out"))
 
     def _attn_weights(self, sd, p, i):
         """q_proj's query halves with k_proj and v_proj in the attention
@@ -184,20 +186,18 @@ class Qwen35Builder(GraphBuilder):
             rows.append(k[g])
             rows.append(v[g])
         rows.append(q[:, 1].reshape(-1, h))
-        w = self._pad_rows(torch.cat(rows, dim=0), self.attn_pw)
-        return (self._attach(w, f"layer_{i}_attn_proj"),
+        return (self._dense(torch.cat(rows, dim=0), f"layer_{i}_attn_proj"),
                 self._attach(sd[sa + "q_norm.weight"], f"layer_{i}_q_norm"),
                 self._attach(sd[sa + "k_norm.weight"], f"layer_{i}_k_norm"),
-                self._attach(sd[sa + "o_proj.weight"], f"layer_{i}_o_proj"))
+                self._dense(sd[sa + "o_proj.weight"], f"layer_{i}_o_proj"))
 
     def _moe_weights(self, sd, p, i):
         """The router with the shared expert's gate as one more row; the
         experts with the shared expert as one more expert, packed for
         moe_gemm_layer (gate and up rows interleaved)."""
         m = f"{p}mlp."
-        router = self._pad_rows(
-            torch.cat([sd[m + "gate.weight"], sd[m + "shared_expert_gate.weight"]],
-                      dim=0), self.router_rows)
+        router = torch.cat([sd[m + "gate.weight"],
+                            sd[m + "shared_expert_gate.weight"]], dim=0)
         w13 = torch.cat(
             [sd[m + "experts.gate_up_proj"],
              torch.cat([sd[m + "shared_expert.gate_proj.weight"],
@@ -208,7 +208,9 @@ class Qwen35Builder(GraphBuilder):
                        dim=0).to("cuda")
         w13 = moe_pack.pack_bf16_tiles(moe_pack.interleave_gate_up(w13))
         w2 = moe_pack.pack_bf16_tiles(w2)
-        return (self._attach(router, f"layer_{i}_router"),
+        small = self.mpk.max_num_batched_tokens * router.shape[0] <= 8192
+        return ((self._attach if small else self._dense)(
+                    router, f"layer_{i}_router"),
                 self._attach(w13, f"layer_{i}_w13"),
                 self._attach(w2, f"layer_{i}_w2"))
 
@@ -223,15 +225,16 @@ class Qwen35Builder(GraphBuilder):
         e_tot = self.num_experts + 1
         self.qkv_size = self.num_kv_heads * (self.q_per_kv + 2) * hd
         self.attn_size = self.num_q_heads * hd
-        self.attn_pw = _round_up(self.qkv_size + self.attn_size, 128)
-        self.gdn_pw = _round_up(4 * self.gdn_key_heads * gd + nvh * gd + 2 * nvh, 128)
-        self.router_rows = _round_up(e_tot, 128)
+        self.attn_pw = self.qkv_size + self.attn_size
+        self.gdn_pw = 4 * self.gdn_key_heads * gd + nvh * gd + 2 * nvh
+        self.router_rows = _round_up(e_tot, 8)
         self.moe_nt = moe_pack.moe_tokens_per_pass(mbt)
         cap = moe_pack.moe_plan_cap(mbt, e_tot, slots, self.moe_nt)
 
         # Debugging aid: MPK_Q35_LAYERS builds only the first layers (then the
         # final norm and the head); MPK_Q35_DUMP keeps the residual stream's
-        # buffers as torch tensors (self.debug) for the demo to save.
+        # buffers as torch tensors (self.debug, with the gated delta net
+        # states) for the demo to save.
         num_layers = int(os.environ.get("MPK_Q35_LAYERS", self.num_layers))
         self.debug = {} if os.environ.get("MPK_Q35_DUMP") else None
         torch_dtype = {bfloat16: torch.bfloat16, float32: torch.float32,
@@ -268,14 +271,30 @@ class Qwen35Builder(GraphBuilder):
         layer_out = buf("layer_out", (mbt, h))
         final_normed = buf("final_normed", (mbt, h))
         argmax_in = buf("argmax_in", (mbt, self.vocab_size))
-        argmax_part_value = buf("argmax_part_value", (mbt, mpk.num_workers))
-        argmax_part_index = buf("argmax_part_index", (mbt, mpk.num_workers), int64)
+        # (the argmax tasks split the vocabulary evenly: as many of them as
+        # workers only if that divides it)
+        argmax_tasks = max(g for g in range(1, mpk.num_workers + 1)
+                           if self.vocab_size % g == 0)
+        argmax_part_value = buf("argmax_part_value", (mbt, argmax_tasks))
+        argmax_part_index = buf("argmax_part_index", (mbt, argmax_tasks), int64)
         argmax_out = mpk.attach_input(torch_tensor=self.output_tokens,
                                       name="output_token")
         cos_dt = self._attach(self.cos_table, "cos_position_embedding")
         sin_dt = self._attach(self.sin_table, "sin_position_embedding")
         norm_dummy = self._attach(torch.ones(hd, dtype=torch.bfloat16),
                                   "qk_norm_dummy")
+        # (MPK_EXTRA_CFLAGS=-DQ35_GDN_DEBUG: a progress record of the gated
+        # delta net tasks, printed by the launch watcher on a stall)
+        self.gdn_debug = None
+        if "Q35_GDN_DEBUG" in os.environ.get("MPK_EXTRA_CFLAGS", ""):
+            self.gdn_debug_tensor = torch.zeros(mpk.num_workers, 4,
+                                                dtype=torch.int32, device="cuda")
+            self.gdn_debug = mpk.attach_input(
+                torch_tensor=self.gdn_debug_tensor, name="gdn_debug")
+        # every GEMM is a moe_gemm task: the workers keep their TMEM across
+        # them (tmem_release_layer at the end)
+        tmem = self._attach(torch.zeros(mpk.num_workers, dtype=torch.int32),
+                            "tmem_token")
 
         mpk.embed_layer(
             input=x, weight=self._attach(sd["embed_tokens.weight"], "embed_tokens"),
@@ -292,17 +311,18 @@ class Qwen35Builder(GraphBuilder):
             if self.layer_types[i] == "linear_attention":
                 w_proj, conv_w, conv_state, state, par, w_out = \
                     self._gdn_weights(sd, p, i)
-                mpk.linear_layer(
-                    input=normed, weight=w_proj, output=gdn_proj,
-                    grid_dim=(self.gdn_pw // 128, 1, 1), block_dim=(256, 1, 1))
+                mpk.dense_gemm_layer(input=normed, weight=w_proj,
+                                     output=gdn_proj, rows=self.gdn_pw,
+                                     tmem=tmem)
                 mpk.gdn_step_layer(gdn_proj, conv_w, conv_state, state, par,
-                                   gdn_out, self.gdn_key_heads, gd, eps=self.eps)
+                                   gdn_out, self.gdn_key_heads, gd, eps=self.eps,
+                                   after=self.gdn_debug)
                 mixed, w_o = gdn_out, w_out
             else:
                 w_proj, wq, wk, w_o = self._attn_weights(sd, p, i)
-                mpk.linear_layer(
-                    input=normed, weight=w_proj, output=attn_proj,
-                    grid_dim=(self.attn_pw // 128, 1, 1), block_dim=(256, 1, 1))
+                mpk.dense_gemm_layer(input=normed, weight=w_proj,
+                                     output=attn_proj, rows=self.attn_pw,
+                                     tmem=tmem)
                 mpk.qsa_prep_layer(attn_proj, wq, wk, attn_in,
                                    self.num_kv_heads, self.q_per_kv, hd,
                                    eps=self.eps)
@@ -329,9 +349,8 @@ class Qwen35Builder(GraphBuilder):
                     rotary_dim=self.rotary_dim, group_id=group_id)
                 mpk.gate_mul_layer(attn_out, attn_proj, self.qkv_size, attn_gated)
                 mixed = attn_gated
-            mpk.linear_with_residual_layer(
-                input=mixed, weight=w_o, residual=x, output=mixer_out,
-                grid_dim=(h // 64, 1, 1), block_dim=(256, 1, 1))
+            mpk.dense_gemm_layer(input=mixed, weight=w_o, residual=x,
+                                 output=mixer_out, rows=h, tmem=tmem)
             x = mixer_out
 
             w_router, w13, w2 = self._moe_weights(sd, p, i)
@@ -339,9 +358,12 @@ class Qwen35Builder(GraphBuilder):
                 x, self._attach(sd[p + "post_attention_layernorm.weight"],
                                 f"layer_{i}_post_norm"),
                 normed, eps=self.eps)
-            mpk.linear_layer(
-                input=normed, weight=w_router, output=logits,
-                grid_dim=(self.router_rows // 128, 1, 1), block_dim=(256, 1, 1))
+            if mbt * e_tot <= 8192:
+                mpk.small_linear_layer(input=normed, weight=w_router,
+                                       output=logits)
+            else:
+                mpk.dense_gemm_layer(input=normed, weight=w_router,
+                                     output=logits, rows=e_tot, tmem=tmem)
             mpk.moe_route_layer(logits=logits, weight=weight,
                                 route_list=route_list, route_meta=route_meta,
                                 nt=self.moe_nt, num_experts=self.num_experts,
@@ -349,25 +371,28 @@ class Qwen35Builder(GraphBuilder):
             mpk.moe_gemm_layer(
                 input=normed, weight=w13, route_list=route_list,
                 route_meta=route_meta, output=act, nt=self.moe_nt, mxfp4=False,
-                rows=2 * self.moe_inter, act=(float("inf"), 1.0, 0.0))
+                rows=2 * self.moe_inter, act=(float("inf"), 1.0, 0.0),
+                tmem=tmem)
             mpk.moe_gemm_layer(
                 input=act, weight=w2, route_list=route_list,
                 route_meta=route_meta, output=mlp_out, nt=self.moe_nt,
-                mxfp4=False, rows=h)
+                mxfp4=False, rows=h, tmem=tmem)
             mpk.moe_combine_layer(input=mlp_out, weight=weight, residual=x,
                                   output=layer_out, shared=True)
             x = layer_out
 
         mpk.norm1p_layer(x, self._attach(sd["norm.weight"], "model_norm"),
                          final_normed, eps=self.eps)
-        mpk.linear_layer(
-            input=final_normed, weight=self._attach(sd["lm_head.weight"], "lm_head"),
-            output=argmax_in,
-            grid_dim=(grid_for_rmsnorm_linear_layer(self.vocab_size), 1, 1),
-            block_dim=(256, 1, 1))
+        mpk.dense_gemm_layer(
+            input=final_normed, weight=self._dense(sd["lm_head.weight"], "lm_head"),
+            output=argmax_in, rows=self.vocab_size, tmem=tmem)
+        mpk.tmem_release_layer(
+            argmax_in, tmem,
+            self._attach(torch.zeros(mpk.num_workers, dtype=torch.int32),
+                         "tmem_done"))
         mpk.argmax_partial_layer(
             input=argmax_in, output=(argmax_part_value, argmax_part_index),
-            grid_dim=(mpk.num_workers, 1, 1), block_dim=(256, 1, 1))
+            grid_dim=(argmax_tasks, 1, 1), block_dim=(256, 1, 1))
         mpk.argmax_reduce_layer(
             input=(argmax_part_value, argmax_part_index), output=argmax_out,
             grid_dim=(1, 1, 1), block_dim=(256, 1, 1))

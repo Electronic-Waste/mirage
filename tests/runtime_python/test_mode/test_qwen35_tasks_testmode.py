@@ -72,11 +72,17 @@ def main():
     ap.add_argument("--batch", type=int, default=5)
     ap.add_argument("--steps", type=int, default=6)
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--gdn-tasks", type=int, default=None,
+                    help="tasks of a gated delta net wave (fewer: more "
+                         "(token, head) units a task)")
     a = ap.parse_args()
     torch.manual_seed(a.seed)
     dev, bf, B = "cuda", torch.bfloat16, a.batch
 
     num_workers, num_schedulers = mirage.get_configurations_from_gpu(0)
+    if os.environ.get("TEST_WORKERS"):  # "<workers>,<schedulers>"
+        num_workers, num_schedulers = (
+            int(v) for v in os.environ["TEST_WORKERS"].split(","))
     params = PersistentKernel.get_default_init_parameters()
     params.update(test_mode=True, num_workers=num_workers,
                   num_local_schedulers=num_schedulers,
@@ -132,7 +138,7 @@ def main():
         pk.gdn_step_layer(pk.attach_input(proj_g[st], name=f"proj_g{st}"),
                           d_cw, d_cs, d_ss, d_par, d_out, NKH, D, eps=EPS,
                           request_map=pk.attach_input(rmap[st], name=f"rmap{st}"),
-                          after=d_prev)
+                          after=d_prev, num_tasks=a.gdn_tasks)
         d_prev = d_out
     print("Compiling test kernel...")
     pk.compile(output_dir=os.path.dirname(os.path.abspath(__file__)))

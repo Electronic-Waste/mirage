@@ -2438,8 +2438,7 @@ class PersistentKernel:
         if mxfp4:
             kb = k // weight.dim(2)
         else:
-            # columns of one weight copy: whole 64-column tiles
-            kb = 128 if k % 128 == 0 else 64
+            kb = self._bf16_step(k, batch, nt)
         assert weight.dim(0) == e_tot and weight.dim(1) == rb
         assert weight.dim(2) * (kb if mxfp4 else 64) == k
         assert output.dim(0) == batch
@@ -2464,6 +2463,38 @@ class PersistentKernel:
              0 if bias is None else 1, 1 if slotted else 0,
              batch, e_tot, slots, nt, k, rows, kb, g, cap] + bits +
             [0, 0, 0, 0 if tmem is None else 1, 0])
+
+    def small_linear_layer(self, input: DTensor, weight: DTensor,
+                           output: DTensor, bias: DTensor = None,
+                           num_tasks: int = None):
+        """output[:, :rows] = input @ weight^T (+ bias) summed by threads, not
+        the tensor core: for a few hundred outputs a wave (an MoE router).
+        input [batch, K], weight [rows, K], bias [rows], output
+        [batch, >= rows], all bf16."""
+        assert self.target_cc in (100, 103)
+        batch, k = input.dim(0), input.dim(1)
+        rows = weight.dim(0)
+        assert weight.dim(1) == k and output.dim(1) >= rows
+        g = min(self.num_workers, (batch * rows + 7) // 8)
+        if num_tasks is not None:
+            g = num_tasks
+        inputs = [input, weight] + ([bias] if bias is not None else [])
+        self.ext_layer("small_linear_sm100", inputs, [output], (g, 1, 1),
+                       [batch, rows, k, output.dim(1),
+                        0 if bias is None else 1, g])
+
+    @staticmethod
+    def _bf16_step(k: int, batch: int, nt: int) -> int:
+        """Columns of one step of a bf16 GEMM unit (one weight copy of whole
+        64-column tiles): the steps' waits are the unit's fixed cost, so as
+        few steps as leave two weight copies and two activation stages in
+        shared memory."""
+        brows = (min(nt, batch) + 7) // 8 * 8
+        for kb in (256, 192, 128):
+            tiles = kb // 64
+            if k % kb == 0 and 2 * tiles * (16384 + brows * 128) <= 180 * 1024:
+                return kb
+        return 64
 
     def tmem_release_layer(self, after, token: DTensor, done: DTensor):
         """The end of the iteration's held TMEM.
@@ -2506,7 +2537,7 @@ class PersistentKernel:
         batch, k = input.dim(0), input.dim(1)
         rb = (rows + 127) // 128
         nt = moe_tokens_per_pass(batch)
-        kb = 128 if k % 128 == 0 else 64
+        kb = self._bf16_step(k, batch, nt)
         assert weight.dim(0) == 1 and weight.dim(1) == rb
         assert weight.dim(2) * 64 == k
         assert output.dim(0) == batch and output.dim(1) >= rows
@@ -2540,11 +2571,11 @@ class PersistentKernel:
         input [batch, slots, H] bf16 (moe_gemm_layer's W2 output), weight
         [batch, slots] float32 (moe_route_layer's), residual and output
         [batch, H] bf16. With shared the last slot is the shared expert's.
-        One task covers 8 tokens: a wave is ceil(batch / 8) tasks at most.
         """
         assert self.target_cc in (100, 103)
         batch, slots, h = input.dim(0), input.dim(1), input.dim(2)
-        g = min(self.num_workers, (batch + 7) // 8)
+        # a lane takes one 8-column chunk at a time
+        g = min(self.num_workers, (batch * (h // 8) + 255) // 256)
         if num_tasks is not None:
             g = num_tasks
         self.ext_layer("moe_combine_sm100", [input, weight, residual],

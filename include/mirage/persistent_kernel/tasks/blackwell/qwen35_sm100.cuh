@@ -283,21 +283,52 @@ __device__ __forceinline__ void
   extern __shared__ char shared_memory[];
   char *base = reinterpret_cast<char *>(
       (reinterpret_cast<uintptr_t>(shared_memory) + 127) / 128 * 128);
+#ifdef Q35_GDN_BAR_FIRST
+  u64 *bar = reinterpret_cast<u64 *>(base);        // the states' arrival
+  float *S = reinterpret_cast<float *>(base + 128); // [2][D][D]
+  float *kn = S + 2 * D * D;                       // [D] normalized k
+  float *qn = kn + D;                              // [D] normalized, scaled q
+  float *red = qn + D;                             // [16] reductions
+#else
   float *S = reinterpret_cast<float *>(base);      // [2][D][D]
   float *kn = S + 2 * D * D;                       // [D] normalized k
   float *qn = kn + D;                              // [D] normalized, scaled q
   float *red = qn + D;                             // [16] reductions
   u64 *bar = reinterpret_cast<u64 *>(red + 16);    // the states' arrival
+#endif
 
   const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
   // thread = (value head vh of the pair, column vd)
   const int vh = tid >> 7, vd = tid & 127;
+#ifdef Q35_GDN_BULK_LOAD
+  // (Not the default: the barrier sits among this task's data, where the SM
+  // may later write back the state it holds of it -- see moe_gemm_sm100's
+  // barrier window -- and its first initialisation can lose to the states
+  // the SM still holds from the worker's last task, hence twice.)
   if (tid == 0) {
+    mbar_init(bar, 1);
+    asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
     mbar_init(bar, 1);
     asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
   }
   __syncthreads();
+#endif
   int loads = 0; // state copies so far: the barrier's phase
+#ifdef Q35_GDN_DEBUG
+  // tuning aid: input [5] is an int32 [workers][4] progress record
+  int *dbg = static_cast<int *>(task_desc->input_ptrs[5]) + 4 * blockIdx.x;
+#define Q35_DBG(stage)                                                         \
+  do {                                                                         \
+    if (tid == 0) {                                                            \
+      dbg[0] = task_i;                                                         \
+      dbg[1] = u;                                                              \
+      dbg[2] = (stage);                                                        \
+      dbg[3] = loads;                                                          \
+    }                                                                          \
+  } while (0)
+#else
+#define Q35_DBG(stage)
+#endif
 #pragma unroll 1
   for (int u = task_i; u < BATCH * NKH; u += G) {
     const int t = u / NKH, hk = u % NKH;
@@ -321,10 +352,32 @@ __device__ __forceinline__ void
     float *sg = sglob + (static_cast<size_t>(rid) * NVH + 2 * hk) * D * D;
 
     // ---- the states on their way in
+#ifdef Q35_GDN_DEBUG
+    if (tid == 0 && !fresh && mxg::mbar_test(bar, loads & 1)) {
+      dbg[0] = task_i;
+      dbg[1] = u;
+      dbg[2] = 9; // the barrier's phase was over before this unit's copy
+      dbg[3] = static_cast<int>(*bar >> 32);
+      while (true) {
+      }
+    }
+#endif
+#ifdef Q35_GDN_BULK_LOAD
     if (tid == 0 && !fresh) {
       mbar_expect(bar, 2 * SBYTES);
       bulk_copy(S, sg, 2 * SBYTES, bar);
     }
+#else
+    // (16-byte copies of every thread, waited for by the thread itself)
+    if (!fresh) {
+#pragma unroll 1
+      for (int i = tid; i < 2 * SBYTES / 16; i += blockDim.x) {
+        cp_async16(reinterpret_cast<char *>(S) + 16 * i,
+                   reinterpret_cast<const char *>(sg) + 16 * i);
+      }
+      asm volatile("cp.async.commit_group;" ::: "memory");
+    }
+#endif
 
     // ---- causal conv + SiLU of this thread's channels: q or k (vh 0 / 1),
     // then its value column
@@ -385,10 +438,16 @@ __device__ __forceinline__ void
     const float decay = __expf(par[2 * hk + vh] * sp);
     const float zg = bf2f(pr[C + (2 * hk + vh) * D + vd]);
     const float wnorm = par[2 * NVH + vd];
+    Q35_DBG(1);
     if (!fresh) {
+#ifdef Q35_GDN_BULK_LOAD
       mbar_wait(bar, loads & 1);
+#else
+      asm volatile("cp.async.wait_group 0;" ::: "memory");
+#endif
       ++loads;
     }
+    Q35_DBG(2);
     __syncthreads();
     // ---- kq = k . q, and this column's S^T k, S^T q
     float kq = warp_sum(vh == 0 ? qn[vd] * kn[vd] : 0.f);
@@ -428,10 +487,12 @@ __device__ __forceinline__ void
       const float y = bfround(wnorm * n) * silu(zg);
       out[static_cast<size_t>(t) * NVH * D + (2 * hk + vh) * D + vd] = f2bf(y);
     }
+    Q35_DBG(3);
     if (tid == 0) {
       bulk_store(sg, S, 2 * SBYTES);
       bulk_store_wait();
     }
+    Q35_DBG(4);
     __syncthreads();
   }
 }

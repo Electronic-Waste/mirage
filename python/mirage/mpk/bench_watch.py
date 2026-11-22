@@ -28,8 +28,9 @@ class LaunchWatch:
     persistent kernel runs); call wait() after it."""
 
     def __init__(self, step: torch.Tensor, profiler: torch.Tensor = None,
-                 num_workers: int = 128):
+                 num_workers: int = 128, extra: dict = None):
         self.step, self.profiler, self.num_workers = step, profiler, num_workers
+        self.extra = extra or {}  # name -> tensor to print on a stall
         self.side = torch.cuda.Stream()
         self.names = _task_names()
 
@@ -59,6 +60,13 @@ class LaunchWatch:
                 print(f"WATCH t={now - t0:7.1f}s no progress for "
                       f"{now - t_prev:.0f} s at positions {cur[0]} .. {cur[1]}",
                       flush=True)
+                for name, t in self.extra.items():
+                    with torch.cuda.stream(self.side):
+                        v = t.to("cpu")
+                    rows = v.reshape(v.shape[0], -1).tolist()
+                    for i in range(0, len(rows), 8):
+                        print(f"WATCH   {name}[{i}:]: {rows[i:i + 8]}",
+                              flush=True)
                 if self.profiler is not None:
                     with torch.cuda.stream(self.side):
                         buf, cnt, etype, eidx = self._last_entries()

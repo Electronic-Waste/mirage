@@ -186,6 +186,9 @@ class GptOssBuilder(GraphBuilder):
              sd[f"{prefix}self_attn.k_proj.bias"],
              sd[f"{prefix}self_attn.v_proj.bias"]],
             self.num_kv_heads, 0)
+        if self.moe == "plan":
+            return (self._dense(w, f"layer_{i}_qkv_proj"),
+                    self._attach(b, f"layer_{i}_qkv_bias"))
         return (self._attach(w, f"layer_{i}_qkv_proj"),
                 self._attach(b.view(1, -1), f"layer_{i}_qkv_bias"))
 
@@ -203,6 +206,11 @@ class GptOssBuilder(GraphBuilder):
                 self._attach(b13, f"layer_{i}_b13"),
                 self._attach(w2, f"layer_{i}_w2"),
                 self._attach(b2, f"layer_{i}_b2"))
+
+    def _dense(self, weight: torch.Tensor, name: str):
+        """A linear layer's weight [rows, K] as dense_gemm_layer's tiles."""
+        return self._attach(
+            moe_pack.pack_bf16_tiles(weight.to("cuda")[None]), name)
 
     def _experts_packed(self, sd, prefix, i):
         """The expert weights in moe_gemm_layer's layouts. Rows stay in the
@@ -237,6 +245,13 @@ class GptOssBuilder(GraphBuilder):
 
         self.x = self.mpk.attach_input(torch_tensor=self.input_tokens,
                                        name="input_token")
+        # plan mode: every GEMM is a moe_gemm task and the workers keep
+        # their TMEM across them (tmem_release_layer at the end)
+        self.tmem = None
+        if self.moe == "plan":
+            self.tmem = self._attach(
+                torch.zeros(self.mpk.num_workers, dtype=torch.int32),
+                "tmem_token")
         self.cos_dt = self._attach(self.cos_table, "cos_position_embedding")
         self.sin_dt = self._attach(self.sin_table, "sin_position_embedding")
         # GPT-OSS has no QK-norm; the kernel still takes the two operands.
@@ -282,11 +297,17 @@ class GptOssBuilder(GraphBuilder):
                                                name="mlp_sum_out", io_category="cuda_tensor")
         self.argmax_in = self.mpk.new_tensor(dims=(mbt, self.padded_vocab_size), dtype=bfloat16,
                                              name="argmax_in", io_category="cuda_tensor")
+        # The argmax tasks split the vocabulary evenly: as many of them as
+        # workers only if that divides it (144 workers and 201728 columns
+        # left 128 over, and every token after the first read its row 128
+        # columns off per token).
+        argmax_tasks = max(g for g in range(1, self.mpk.num_workers + 1)
+                           if self.padded_vocab_size % g == 0)
         self.argmax_part_value = self.mpk.new_tensor(
-            dims=(mbt, self.mpk.num_workers), dtype=bfloat16,
+            dims=(mbt, argmax_tasks), dtype=bfloat16,
             name="argmax_part_value", io_category="cuda_tensor")
         self.argmax_part_index = self.mpk.new_tensor(
-            dims=(mbt, self.mpk.num_workers), dtype=int64,
+            dims=(mbt, argmax_tasks), dtype=int64,
             name="argmax_part_index", io_category="cuda_tensor")
         argmax_out = self.mpk.attach_input(torch_tensor=self.output_tokens,
                                            name="output_token")
@@ -306,16 +327,26 @@ class GptOssBuilder(GraphBuilder):
             weight=self._attach(state_dict["model.norm.weight"], "model_norm"),
             output=self.rmsnorm_out,
             grid_dim=(mbt, 1, 1), block_dim=(256, 1, 1))
-        self.mpk.linear_layer(
-            input=self.rmsnorm_out,
-            weight=self._attach(lm_head, "lm_head"),
-            output=self.argmax_in,
-            grid_dim=(grid_for_rmsnorm_linear_layer(self.padded_vocab_size), 1, 1),
-            block_dim=(256, 1, 1))
+        if self.moe == "plan":
+            self.mpk.dense_gemm_layer(
+                input=self.rmsnorm_out, weight=self._dense(lm_head, "lm_head"),
+                output=self.argmax_in, rows=self.padded_vocab_size,
+                tmem=self.tmem)
+            self.mpk.tmem_release_layer(
+                self.argmax_in, self.tmem,
+                self._attach(torch.zeros(self.mpk.num_workers,
+                                         dtype=torch.int32), "tmem_done"))
+        else:
+            self.mpk.linear_layer(
+                input=self.rmsnorm_out,
+                weight=self._attach(lm_head, "lm_head"),
+                output=self.argmax_in,
+                grid_dim=(grid_for_rmsnorm_linear_layer(self.padded_vocab_size), 1, 1),
+                block_dim=(256, 1, 1))
         self.mpk.argmax_partial_layer(
             input=self.argmax_in,
             output=(self.argmax_part_value, self.argmax_part_index),
-            grid_dim=(self.mpk.num_workers, 1, 1), block_dim=(256, 1, 1))
+            grid_dim=(argmax_tasks, 1, 1), block_dim=(256, 1, 1))
         self.mpk.argmax_reduce_layer(
             input=(self.argmax_part_value, self.argmax_part_index),
             output=argmax_out, grid_dim=(1, 1, 1), block_dim=(256, 1, 1))
@@ -339,11 +370,17 @@ class GptOssBuilder(GraphBuilder):
                                     f"layer_{i}_input_norm"),
                 output=self.rmsnorm_out,
                 grid_dim=(mbt, 1, 1), block_dim=(256, 1, 1))
-            self.mpk.linear_layer(
-                input=self.rmsnorm_out, weight=w_qkv, bias=b_qkv,
-                output=self.attn_in,
-                grid_dim=(_grid_x(self.fused_qkv_size, 80), 1, 1),
-                block_dim=(256, 1, 1))
+            if self.moe == "plan":
+                self.mpk.dense_gemm_layer(
+                    input=self.rmsnorm_out, weight=w_qkv, bias=b_qkv,
+                    output=self.attn_in, rows=self.fused_qkv_size,
+                    tmem=self.tmem)
+            else:
+                self.mpk.linear_layer(
+                    input=self.rmsnorm_out, weight=w_qkv, bias=b_qkv,
+                    output=self.attn_in,
+                    grid_dim=(_grid_x(self.fused_qkv_size, 80), 1, 1),
+                    block_dim=(256, 1, 1))
 
             # Which page table this layer reads, and which slot of the pool
             # it owns. Attached directly rather than through _attach, whose
@@ -378,19 +415,30 @@ class GptOssBuilder(GraphBuilder):
             # o_proj has two addends and the epilogue one slot. The residual
             # takes it, since it must be added exactly once ahead of a
             # tensor-parallel allreduce; the bias follows as a separate add.
-            self.mpk.linear_with_residual_layer(
-                input=self.attn_out,
-                weight=self._attach(sd[f"{prefix}self_attn.o_proj.weight"],
-                                    f"layer_{i}_o_proj"),
-                residual=self.x, output=self.attn_proj_out,
-                grid_dim=(_grid_x(h, 64), 1, 1), block_dim=(256, 1, 1))
-            self.mpk.elementwise_add_layer(
-                input_a=self.attn_proj_out,
-                input_b=self._attach(
-                    sd[f"{prefix}self_attn.o_proj.bias"].view(1, -1).expand(mbt, h),
-                    f"layer_{i}_o_bias"),
-                output=self.attn_biased_out,
-                grid_dim=(mbt, 1, 1), block_dim=(256, 1, 1))
+            if self.moe == "plan":
+                # o_proj, its bias and the residual in one wave
+                self.mpk.dense_gemm_layer(
+                    input=self.attn_out,
+                    weight=self._dense(sd[f"{prefix}self_attn.o_proj.weight"],
+                                       f"layer_{i}_o_proj"),
+                    bias=self._attach(sd[f"{prefix}self_attn.o_proj.bias"],
+                                      f"layer_{i}_o_bias"),
+                    residual=self.x, output=self.attn_biased_out, rows=h,
+                    tmem=self.tmem)
+            else:
+                self.mpk.linear_with_residual_layer(
+                    input=self.attn_out,
+                    weight=self._attach(sd[f"{prefix}self_attn.o_proj.weight"],
+                                        f"layer_{i}_o_proj"),
+                    residual=self.x, output=self.attn_proj_out,
+                    grid_dim=(_grid_x(h, 64), 1, 1), block_dim=(256, 1, 1))
+                self.mpk.elementwise_add_layer(
+                    input_a=self.attn_proj_out,
+                    input_b=self._attach(
+                        sd[f"{prefix}self_attn.o_proj.bias"].view(1, -1).expand(mbt, h),
+                        f"layer_{i}_o_bias"),
+                    output=self.attn_biased_out,
+                    grid_dim=(mbt, 1, 1), block_dim=(256, 1, 1))
             self.x = self.attn_biased_out
 
             self.mpk.rmsnorm_layer(
@@ -399,13 +447,33 @@ class GptOssBuilder(GraphBuilder):
                                     f"layer_{i}_post_attn_norm"),
                 output=self.rmsnorm_out,
                 grid_dim=(mbt, 1, 1), block_dim=(256, 1, 1))
-            self.mpk.linear_layer(
-                input=self.rmsnorm_out,
-                weight=self._attach(sd[f"{prefix}mlp.router.weight"],
-                                    f"layer_{i}_router"),
-                bias=self._attach(sd[f"{prefix}mlp.router.bias"].view(1, -1),
-                                  f"layer_{i}_router_bias"),
-                output=self.gate_out, grid_dim=(1, 1, 1), block_dim=(256, 1, 1))
+            if self.moe == "plan" and mbt * self.num_experts <= 8192:
+                # a few hundred dot products: threads beat a GEMM unit's
+                # chain of K / 16 MMAs
+                self.mpk.small_linear_layer(
+                    input=self.rmsnorm_out,
+                    weight=self._attach(sd[f"{prefix}mlp.router.weight"],
+                                        f"layer_{i}_router"),
+                    bias=self._attach(sd[f"{prefix}mlp.router.bias"],
+                                      f"layer_{i}_router_bias"),
+                    output=self.gate_out)
+            elif self.moe == "plan":
+                self.mpk.dense_gemm_layer(
+                    input=self.rmsnorm_out,
+                    weight=self._dense(sd[f"{prefix}mlp.router.weight"],
+                                       f"layer_{i}_router"),
+                    bias=self._attach(sd[f"{prefix}mlp.router.bias"],
+                                      f"layer_{i}_router_bias"),
+                    output=self.gate_out, rows=self.num_experts,
+                    tmem=self.tmem)
+            else:
+                self.mpk.linear_layer(
+                    input=self.rmsnorm_out,
+                    weight=self._attach(sd[f"{prefix}mlp.router.weight"],
+                                        f"layer_{i}_router"),
+                    bias=self._attach(sd[f"{prefix}mlp.router.bias"].view(1, -1),
+                                      f"layer_{i}_router_bias"),
+                    output=self.gate_out, grid_dim=(1, 1, 1), block_dim=(256, 1, 1))
             if self.moe == "plan":
                 # (routing_indices holds the plan's token lists here)
                 self.mpk.moe_route_layer(
@@ -417,12 +485,12 @@ class GptOssBuilder(GraphBuilder):
                     route_list=self.routing_indices,
                     route_meta=self.route_meta, output=self.swiglu_out,
                     nt=self.moe_nt, mxfp4=self.mxfp4, rows=2 * ii,
-                    act=(self.swiglu_limit, 1.702, 1.0))
+                    act=(self.swiglu_limit, 1.702, 1.0), tmem=self.tmem)
                 self.mpk.moe_gemm_layer(
                     input=self.swiglu_out, weight=w2, bias=b2,
                     route_list=self.routing_indices,
                     route_meta=self.route_meta, output=self.mlp_out,
-                    nt=self.moe_nt, mxfp4=self.mxfp4, rows=h)
+                    nt=self.moe_nt, mxfp4=self.mxfp4, rows=h, tmem=self.tmem)
             else:
                 self.mpk.moe_topk_softmax_routing_layer(
                     input=self.gate_out,

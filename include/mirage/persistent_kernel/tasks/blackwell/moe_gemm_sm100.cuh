@@ -505,13 +505,13 @@ __device__ __forceinline__ void
   constexpr int ABLK = MX ? NCH * 128 * 16 + 128 * NCH : TPB * 128 * 128;
   constexpr int ACOLS = KB / 2; // MX: TMEM columns of an A stage
   constexpr int AS = 2;         // accumulator stages
-  // An MMA that adds to an accumulator waits for the one before it (about
-  // 55 ns each, whatever its size): the K steps of a unit go round NACC
-  // accumulators, which the epilogue adds up.
+  // (An MMA costs the issuing thread 35 .. 45 ns whatever its N. Spreading
+  // a unit's MMAs over NACC independent accumulators that the epilogue adds
+  // up was tried, 4 at NT 16: no gain, so it is not a dependency chain.)
 #ifdef MXG_NACC
   constexpr int NACC = MXG_NACC;
 #else
-  constexpr int NACC = NT <= 32 ? 4 : (NT <= 64 ? 2 : 1);
+  constexpr int NACC = 1;
 #endif
   constexpr int ACC_COLS = NACC * NT; // TMEM columns of an accumulator stage
   // rows of a B box: the most tokens a pass can have
@@ -521,21 +521,46 @@ __device__ __forceinline__ void
   constexpr int NTL = BROWS / 8;     // gather: tokens of a lane
   constexpr int MAXU = 64;           // units of a task
   constexpr int SMEM_TOTAL = 196 * 1024;
-  constexpr int STGB_FIT = (100 * 1024) / BSTG;
-  constexpr int STGB = STGB_FIT >= NKB ? NKB : (STGB_FIT < 2 ? 2 : STGB_FIT);
-  constexpr int STG_FIT = (SMEM_TOTAL - 8192 - STGB * BSTG) / ABLK;
+  // MX: up to 100 KB of B stages, the rest for weight copies (13 KB each).
+  // bf16: two B stages reserved, weight copies (16 KB a 64-column tile) in
+  // the rest, then B stages in what they leave.
   constexpr int STG_MAX = MX ? 8 : 6;
-  constexpr int STG = STG_FIT > STG_MAX ? STG_MAX : STG_FIT; // weight copies
+  constexpr int STGB_MX = (100 * 1024) / BSTG >= NKB
+                              ? NKB
+                              : ((100 * 1024) / BSTG < 2 ? 2 : (100 * 1024) / BSTG);
+  constexpr int STG_BF = (SMEM_TOTAL - 8192 - 2 * BSTG) / ABLK;
+  constexpr int STG_FIT = MX ? (SMEM_TOTAL - 8192 - STGB_MX * BSTG) / ABLK
+                             : (STG_BF < 1 ? 1 : STG_BF);
+  constexpr int STG_0 = STG_FIT > STG_MAX ? STG_MAX : STG_FIT; // weight copies
+  constexpr int STGB_BF = (SMEM_TOTAL - 8192 - STG_0 * ABLK) / BSTG;
+  constexpr int STGB_1 = MX ? STGB_MX : (STGB_BF >= NKB ? NKB : STGB_BF);
+  // B2X: both of two consecutive units' activations fit (small batches). A
+  // unit then has its own NKB stages by parity, the gather of unit j waits
+  // only for unit j - 2's last MMA (acc_full), and the MMAs commit no B
+  // barrier at all: 15 commits a unit less, and the next unit's activations
+  // are in before its first weights are.
+  constexpr int A_MIN = MX ? 4 * ABLK : 2 * ABLK;
+  constexpr bool B2X =
+      2 * NKB * BSTG + A_MIN + 8192 <= SMEM_TOTAL && STGB_1 == NKB;
+  constexpr int STGB = B2X ? 2 * NKB : STGB_1;
+  constexpr int STG_B2X = (SMEM_TOTAL - 8192 - 2 * NKB * BSTG) / ABLK;
+  constexpr int STG = B2X ? (STG_B2X > STG_MAX ? STG_MAX : STG_B2X) : STG_0;
   constexpr int SA_FIT = (512 - AS * ACC_COLS) / ACOLS;
   constexpr int SA = MX ? (SA_FIT > 4 ? 4 : SA_FIT) : STG; // A stages
   constexpr int OUT = ACT ? ROWS / 2 : ROWS;
   constexpr int AREG = (STG * ABLK + 1023) / 1024 * 1024;
   constexpr int BREG = STGB * BSTG;
   constexpr int NBAR = 2 * STG + 2 * SA + 2 * STGB + 2 * AS;
-  constexpr int SMEM = AREG + BREG + 8 * NBAR + 16 * MAXU + 8 * NT + 64;
+  constexpr int SMEM = AREG + BREG + 16 * MAXU + 8 * NT + 64;
+  constexpr int BARWIN = 1024; // bytes of the barriers' window
+  static_assert(8 * (NBAR + 8) + 8 <= BARWIN, "barriers");
+  static_assert(SMEM_TOTAL + 1024 + BARWIN <=
+                    mirage::runtime::MAX_DYNAMIC_SHARED_MEMORY_SIZE,
+                "the stages stay clear of the barriers' window");
   static_assert(K % KB == 0 && KB % 64 == 0, "K steps");
   static_assert(NT % 16 == 0 && NT >= 16 && NT <= 128, "tokens of a pass");
   static_assert(STG >= 1 && SA >= 1 && STGB >= 1, "ring depths");
+  static_assert(AS == 2, "B2X pairs units with accumulator stages");
   static_assert(AS * ACC_COLS <= 512, "TMEM: the accumulators");
   static_assert(!ACT || ROWS % 2 == 0, "gate / up row pairs");
   static_assert(SMEM + 2048 <= SMEM_TOTAL, "shared memory");
@@ -582,15 +607,28 @@ __device__ __forceinline__ void
   char *breg = areg + AREG;
   // (the MMA reads 16 rows of a B box at least: past an 8-row box it reads
   // the next box, or what follows the ring -- columns the epilogue ignores)
-  u64 *x_full = reinterpret_cast<u64 *>(breg + BREG); // a weight copy landed
-  u64 *x_empty = x_full + STG;                        // ... and was consumed
+  // The barriers: the last BARWIN bytes of the worker's dynamic shared
+  // memory, in every instance of this task, and nothing else is ever put
+  // there. The SM keeps barrier states of its own and writes them back to
+  // shared memory later -- when a barrier is next initialised, when the
+  // context is switched out for another process -- at the addresses they
+  // had, whatever the current task keeps there: with the barriers after
+  // each instance's stages, one instance's old barriers landed in the
+  // activations of another (a token's row wrong for one unit, on every
+  // worker at once, whenever a second process shared the GPU).
+  u64 *bar_flush = reinterpret_cast<u64 *>(
+      (reinterpret_cast<uintptr_t>(shared_memory) +
+       mirage::runtime::MAX_DYNAMIC_SHARED_MEMORY_SIZE - BARWIN + 7) /
+      8 * 8);                    // [8]: a warp's own (see below)
+  u64 *x_full = bar_flush + 8;   // a weight copy landed
+  u64 *x_empty = x_full + STG;   // ... and was consumed
   u64 *a_ready = x_empty + STG; // MX: an A stage is in TMEM
   u64 *a_empty = a_ready + SA;  // MX: ... and the MMAs have read it
   u64 *b_full = a_empty + SA;
   u64 *b_empty = b_full + STGB;
   u64 *acc_full = b_empty + STGB;
   u64 *acc_empty = acc_full + AS;
-  int *ut = reinterpret_cast<int *>(acc_empty + AS); // [MAXU][4]
+  int *ut = reinterpret_cast<int *>(breg + BREG); // [MAXU][4]
   int *elist = ut + 4 * MAXU;                        // [2][NT]
   int *misc = elist + 2 * NT;                        // n_ep, tmem base
 
@@ -628,6 +666,16 @@ __device__ __forceinline__ void
     ut[tid * 4 + 3] = left < NT ? left : NT;
   }
   if (tid == 0) {
+    // The window holds the last GEMM task's barriers, and the SM its states
+    // of them: the first mbarrier.init of a task (a store, then an
+    // invalidation of the SM's barrier states) lost to those, so that the
+    // barriers initialised first kept the old task's phase -- an odd one let
+    // the weight copies run a stage ahead of the MMAs (wrong weights, or an
+    // arrive on a copy still in flight: an illegal instruction). A barrier
+    // nothing uses goes first and takes that; what follows is initialised on
+    // a clean slate.
+    mbar_init(bar_flush, 1);
+    asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
 #pragma unroll 1
     for (int i = 0; i < STG; ++i) {
       mbar_init(&x_full[i], 1);
@@ -852,7 +900,9 @@ __device__ __forceinline__ void
           tmem_fence_after();
           const unsigned char *blk =
               reinterpret_cast<const unsigned char *>(areg) + s * ABLK;
-#pragma unroll
+          // (a loop over the block's tiles: as fast as its copies once
+          // warm, and a third of the code to fetch on a task's first block)
+#pragma unroll 1
           for (int h = 0; h < TPB; ++h) {
             unsigned v[32];
 #ifdef MXG_ABL_NO_DQ
@@ -977,11 +1027,11 @@ __device__ __forceinline__ void
 #endif
 #pragma unroll 1
         for (int kb = 0; kb < NKB; ++kb, ++gs) {
-          const int bs = gs % STGB, sa = gs % SA;
+          const int bs = B2X ? (j & 1) * NKB + kb : gs % STGB, sa = gs % SA;
 #ifdef MXG_TRACE
           const long long tw0 = mxg_now();
 #endif
-          mbar_wait(&b_full[bs], (gs / STGB) & 1);
+          mbar_wait(&b_full[bs], (B2X ? j / 2 : gs / STGB) & 1);
 #ifdef MXG_TRACE
           const long long tw1 = mxg_now();
 #endif
@@ -994,13 +1044,16 @@ __device__ __forceinline__ void
 #ifdef MXG_TRACE
           const long long tw2 = mxg_now();
 #endif
+          // (unrolled: a loop here costs the MMA thread a quarter more per
+          // MMA while the conversion warps keep the SM busy)
 #pragma unroll
           for (int b = 0; b < TPB; ++b) {
             const u64 bd = smem_desc(sm_u32(breg + bs * BSTG + b * BBOX));
 #pragma unroll
             for (int kk = 0; kk < 4; ++kk, ++mi) {
-              const int accf = mi >= NACC ? 1 : 0;
-              const unsigned tdm = td + (mi % NACC) * NT;
+              static_assert((TPB * 4) % NACC == 0, "accumulator of an MMA");
+              const int accf = (kb > 0 || b * 4 + kk >= NACC) ? 1 : 0;
+              const unsigned tdm = td + ((b * 4 + kk) % NACC) * NT;
 #ifdef MXG_ABL_NO_MMA
               if (mi > 0) {
                 continue;
@@ -1025,7 +1078,9 @@ __device__ __forceinline__ void
 #ifdef MXG_TRACE
           const long long tw3 = mxg_now();
 #endif
-          umma_commit(&b_empty[bs]);
+          if (!B2X) {
+            umma_commit(&b_empty[bs]);
+          }
           umma_commit(MX ? &a_empty[sa] : &x_empty[sa]);
 #ifdef MXG_TRACE
           const long long tw4 = mxg_now();
@@ -1079,10 +1134,14 @@ __device__ __forceinline__ void
           src[it] = x + r * (K * 2) + c * 16;
         }
       }
+      if (B2X && j >= 2) {
+        // unit j - 2's MMAs are over: its stages are this unit's
+        mbar_wait(&acc_full[j % AS], ((j - 2) / AS) & 1);
+      }
 #pragma unroll 1
       for (int kb = 0; kb < NKB; ++kb, ++gs) {
-        const int bs = gs % STGB;
-        if (gs >= STGB) {
+        const int bs = B2X ? (j & 1) * NKB + kb : gs % STGB;
+        if (!B2X && gs >= STGB) {
           mbar_wait(&b_empty[bs], ((gs / STGB) - 1) & 1);
         }
         char *bst = breg + bs * BSTG;
@@ -1100,6 +1159,13 @@ __device__ __forceinline__ void
         cp_async_arrive(&b_full[bs]);
       }
     }
+  }
+  __syncthreads();
+  // Every warp that used barriers drops what the SM holds of them (an
+  // initialisation of a barrier of its own).
+  if (lane == 0) {
+    mbar_init(&bar_flush[warp], 1);
+    asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
   }
   __syncthreads();
   if (!HELD && warp == 0) {
@@ -1120,7 +1186,9 @@ __device__ __forceinline__ void
 // shared expert) is added to the rounded sum of the routed ones.
 // inputs: [0] out bf16 [BATCH][SLOTS][H]; [1] w fp32 [BATCH][SLOTS];
 // [2] residual bf16 [BATCH][H]. outputs: [0] y bf16 [BATCH][H].
-// A warp per token; lane l holds the 16-byte chunks l, l + 32, ...
+// Unit = (token, 16-byte chunk of 8 columns); the wave's lanes take the units
+// round-robin (a lane's loads of one unit are in flight together; a warp
+// walking a token's chunks one after another would wait for each).
 // ---------------------------------------------------------------------------
 template <int BATCH, int SLOTS, int H, int G, int SHARED, class TD, class RC>
 __device__ __forceinline__ void
@@ -1133,54 +1201,117 @@ __device__ __forceinline__ void
   const float *wt = static_cast<const float *>(task_desc->input_ptrs[1]);
   const uint4 *res = static_cast<const uint4 *>(task_desc->input_ptrs[2]);
   uint4 *y = static_cast<uint4 *>(task_desc->output_ptrs[0]);
+  const int nthreads = blockDim.x;
+  const int gid = static_cast<int>(task_desc->task_metadata.ext_bid_x) * nthreads +
+                  threadIdx.x;
+#pragma unroll 1
+  for (int u = gid; u < BATCH * NCHUNK; u += G * nthreads) {
+    const int t = u / NCHUNK, c = u % NCHUNK;
+    const uint4 *ir = in + static_cast<size_t>(t) * SLOTS * NCHUNK;
+    uint4 v[SLOTS];
+    float w[SLOTS];
+#pragma unroll
+    for (int s = 0; s < SLOTS; ++s) {
+      v[s] = ir[s * NCHUNK + c];
+      w[s] = wt[static_cast<size_t>(t) * SLOTS + s];
+    }
+    const uint4 rv = res[static_cast<size_t>(t) * NCHUNK + c];
+    float acc[8] = {0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
+    float sh[8] = {0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
+#pragma unroll
+    for (int s = 0; s < SLOTS; ++s) {
+      const unsigned *p = reinterpret_cast<const unsigned *>(&v[s]);
+#pragma unroll
+      for (int j = 0; j < 4; ++j) {
+        const float lo = bfround(bf2f(p[j] & 0xffff) * w[s]);
+        const float hi = bfround(bf2f(p[j] >> 16) * w[s]);
+        if (s < ROUTED) {
+          acc[2 * j] += lo;
+          acc[2 * j + 1] += hi;
+        } else {
+          sh[2 * j] = lo;
+          sh[2 * j + 1] = hi;
+        }
+      }
+    }
+    const unsigned *q = reinterpret_cast<const unsigned *>(&rv);
+    uint4 o;
+    unsigned *r = reinterpret_cast<unsigned *>(&o);
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {
+      float lo = bfround(acc[2 * j]), hi = bfround(acc[2 * j + 1]);
+      if (SHARED) {
+        lo = bfround(lo + sh[2 * j]);
+        hi = bfround(hi + sh[2 * j + 1]);
+      }
+      r[j] = static_cast<unsigned>(f2bf(bf2f(q[j] & 0xffff) + lo)) |
+             (static_cast<unsigned>(f2bf(bf2f(q[j] >> 16) + hi)) << 16);
+    }
+    y[static_cast<size_t>(t) * NCHUNK + c] = o;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// A small linear layer without the tensor core: y[t][r] = x[t] . W[r] (+ b[r]),
+// fp32 sums of bf16 products rounded once to bf16. A K-long row costs a GEMM
+// unit K / 16 MMAs in a chain whatever its size (about 7 us at K = 2880); a
+// router's few hundred outputs are done sooner by threads.
+// inputs: [0] x bf16 [BATCH][K]; [1] W bf16 [ROWS][K]; [2] (HAS_BIAS) b bf16
+// [ROWS]. outputs: [0] y bf16 [BATCH][OSTRIDE].
+// Unit = (token, row), one a warp at a time: lane l sums the 16-byte chunks
+// l, l + 32, ... of the row.
+// ---------------------------------------------------------------------------
+template <int BATCH,
+          int ROWS,
+          int K,
+          int OSTRIDE,
+          int HAS_BIAS,
+          int G,
+          class TD,
+          class RC>
+__device__ __forceinline__ void
+    small_linear_sm100(TD const *task_desc, RC const &runtime_config) {
+  using namespace mxg;
+  constexpr int NCHUNK = K / 8;
+  constexpr int CPL = (NCHUNK + 31) / 32; // chunks a lane
+  static_assert(K % 8 == 0, "16 B chunks");
+  const uint4 *x = static_cast<const uint4 *>(task_desc->input_ptrs[0]);
+  const uint4 *w = static_cast<const uint4 *>(task_desc->input_ptrs[1]);
+  const unsigned short *bias =
+      HAS_BIAS ? static_cast<const unsigned short *>(task_desc->input_ptrs[2])
+               : nullptr;
+  unsigned short *y = static_cast<unsigned short *>(task_desc->output_ptrs[0]);
   const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
   const int nwarps = blockDim.x >> 5;
   const int gw = static_cast<int>(task_desc->task_metadata.ext_bid_x) * nwarps +
                  warp;
 #pragma unroll 1
-  for (int t = gw; t < BATCH; t += G * nwarps) {
-    float w[SLOTS];
+  for (int u = gw; u < BATCH * ROWS; u += G * nwarps) {
+    const int t = u / ROWS, r = u % ROWS;
+    const uint4 *xr = x + static_cast<size_t>(t) * NCHUNK;
+    const uint4 *wr = w + static_cast<size_t>(r) * NCHUNK;
+    float acc = 0.f;
 #pragma unroll
-    for (int s = 0; s < SLOTS; ++s) {
-      w[s] = wt[static_cast<size_t>(t) * SLOTS + s];
-    }
-    const uint4 *ir = in + static_cast<size_t>(t) * SLOTS * NCHUNK;
-#pragma unroll 1
-    for (int c = lane; c < NCHUNK; c += 32) {
-      float acc[8] = {0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
-      float sh[8] = {0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
-#pragma unroll
-      for (int s = 0; s < SLOTS; ++s) {
-        const uint4 v = ir[s * NCHUNK + c];
-        const unsigned *p = reinterpret_cast<const unsigned *>(&v);
+    for (int i = 0; i < CPL; ++i) {
+      const int c = lane + 32 * i;
+      if (c < NCHUNK) {
+        const uint4 xv = xr[c], wv = wr[c];
+        const unsigned *p = reinterpret_cast<const unsigned *>(&xv);
+        const unsigned *q = reinterpret_cast<const unsigned *>(&wv);
 #pragma unroll
         for (int j = 0; j < 4; ++j) {
-          const float lo = bfround(bf2f(p[j] & 0xffff) * w[s]);
-          const float hi = bfround(bf2f(p[j] >> 16) * w[s]);
-          if (s < ROUTED) {
-            acc[2 * j] += lo;
-            acc[2 * j + 1] += hi;
-          } else {
-            sh[2 * j] = lo;
-            sh[2 * j + 1] = hi;
-          }
+          acc += bf2f(p[j] & 0xffff) * bf2f(q[j] & 0xffff) +
+                 bf2f(p[j] >> 16) * bf2f(q[j] >> 16);
         }
       }
-      const uint4 rv = res[static_cast<size_t>(t) * NCHUNK + c];
-      const unsigned *q = reinterpret_cast<const unsigned *>(&rv);
-      uint4 o;
-      unsigned *r = reinterpret_cast<unsigned *>(&o);
+    }
 #pragma unroll
-      for (int j = 0; j < 4; ++j) {
-        float lo = bfround(acc[2 * j]), hi = bfround(acc[2 * j + 1]);
-        if (SHARED) {
-          lo = bfround(lo + sh[2 * j]);
-          hi = bfround(hi + sh[2 * j + 1]);
-        }
-        r[j] = static_cast<unsigned>(f2bf(bf2f(q[j] & 0xffff) + lo)) |
-               (static_cast<unsigned>(f2bf(bf2f(q[j] >> 16) + hi)) << 16);
-      }
-      y[static_cast<size_t>(t) * NCHUNK + c] = o;
+    for (int off = 16; off > 0; off >>= 1) {
+      acc += __shfl_xor_sync(0xffffffffu, acc, off);
+    }
+    if (lane == 0) {
+      const float b = HAS_BIAS ? bf2f(bias[r]) : 0.f;
+      y[static_cast<size_t>(t) * OSTRIDE + r] = f2bf(acc + b);
     }
   }
 }
