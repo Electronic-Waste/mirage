@@ -37,22 +37,6 @@ __device__ __forceinline__ float silu(float x) {
 __device__ __forceinline__ float sigmoid(float x) {
   return 1.f / (1.f + __expf(fminf(-x, 40.f)));
 }
-// shared -> global bulk store of this thread, and its completion
-__device__ __forceinline__ void
-    bulk_store(void *dst, const void *src, unsigned bytes) {
-  asm volatile("cp.async.bulk.global.shared::cta.bulk_group [%0], [%1], %2;" ::
-                   "l"(reinterpret_cast<u64>(dst)),
-               "r"(mxg::sm_u32(src)),
-               "r"(bytes)
-               : "memory");
-  asm volatile("cp.async.bulk.commit_group;" ::: "memory");
-}
-__device__ __forceinline__ void bulk_store_wait() {
-  asm volatile("cp.async.bulk.wait_group 0;" ::: "memory");
-}
-__device__ __forceinline__ void fence_async_shared() {
-  asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
-}
 
 } // namespace q35
 
@@ -238,66 +222,81 @@ __device__ __forceinline__ void
 // Full attention, after the attention task: y = a * sigmoid(gate), both
 // factors bf16 as in the reference. inputs: [0] a bf16 [BATCH][W]; [1] proj
 // bf16 [BATCH][PW], the gates at column GOFF. outputs: [0] y bf16 [BATCH][W].
-// A warp per token, W / 256 chunks a lane.
+// Unit = (token, 16-byte chunk of 8 columns); the wave's lanes take the units
+// round-robin, two at a time (a warp alone with a token walked its chunks one
+// after another, each waiting for its loads: 7.5 us a token).
 // ---------------------------------------------------------------------------
 template <int BATCH, int W, int PW, int GOFF, int G, class TD, class RC>
 __device__ __forceinline__ void
     gate_mul_sm100(TD const *task_desc, RC const &runtime_config) {
   using namespace q35;
-  constexpr int CPL = W / 256;
-  static_assert(W % 256 == 0 && GOFF % 8 == 0 && PW % 8 == 0, "16 B chunks");
+  constexpr int NCHUNK = W / 8;
+  static_assert(W % 8 == 0 && GOFF % 8 == 0 && PW % 8 == 0, "16 B chunks");
   const uint4 *a = static_cast<const uint4 *>(task_desc->input_ptrs[0]);
   const uint4 *proj = static_cast<const uint4 *>(task_desc->input_ptrs[1]);
   uint4 *y = static_cast<uint4 *>(task_desc->output_ptrs[0]);
-  const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
-  const int nwarps = blockDim.x >> 5;
-  const int gw = static_cast<int>(task_desc->task_metadata.ext_bid_x) * nwarps +
-                 warp;
+  const int nthreads = blockDim.x;
+  const int stride = G * nthreads;
+  const int gid = static_cast<int>(task_desc->task_metadata.ext_bid_x) * nthreads +
+                  threadIdx.x;
 #pragma unroll 1
-  for (int t = gw; t < BATCH; t += G * nwarps) {
-    const uint4 *ar = a + static_cast<size_t>(t) * (W / 8);
-    const uint4 *gr = proj + (static_cast<size_t>(t) * PW + GOFF) / 8;
-    uint4 *yr = y + static_cast<size_t>(t) * (W / 8);
-#pragma unroll 1
-    for (int i = 0; i < CPL; ++i) {
-      const uint4 av = ar[lane + 32 * i], gv = gr[lane + 32 * i];
-      const unsigned *p = reinterpret_cast<const unsigned *>(&av);
-      const unsigned *q = reinterpret_cast<const unsigned *>(&gv);
-      uint4 o;
-      unsigned *r = reinterpret_cast<unsigned *>(&o);
+  for (int u0 = gid; u0 < BATCH * NCHUNK; u0 += 2 * stride) {
+    uint4 av[2], gv[2];
 #pragma unroll
-      for (int j = 0; j < 4; ++j) {
-        const float lo = bf2f(p[j] & 0xffff) * bfround(sigmoid(bf2f(q[j] & 0xffff)));
-        const float hi = bf2f(p[j] >> 16) * bfround(sigmoid(bf2f(q[j] >> 16)));
-        r[j] = static_cast<unsigned>(f2bf(lo)) |
-               (static_cast<unsigned>(f2bf(hi)) << 16);
+    for (int i = 0; i < 2; ++i) {
+      const int u = u0 + i * stride;
+      if (u < BATCH * NCHUNK) {
+        const int t = u / NCHUNK, c = u % NCHUNK;
+        av[i] = a[static_cast<size_t>(t) * NCHUNK + c];
+        gv[i] = proj[(static_cast<size_t>(t) * PW + GOFF) / 8 + c];
       }
-      yr[lane + 32 * i] = o;
+    }
+#pragma unroll
+    for (int i = 0; i < 2; ++i) {
+      const int u = u0 + i * stride;
+      if (u < BATCH * NCHUNK) {
+        const unsigned *p = reinterpret_cast<const unsigned *>(&av[i]);
+        const unsigned *q = reinterpret_cast<const unsigned *>(&gv[i]);
+        uint4 o;
+        unsigned *r = reinterpret_cast<unsigned *>(&o);
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+          const float lo =
+              bf2f(p[j] & 0xffff) * bfround(sigmoid(bf2f(q[j] & 0xffff)));
+          const float hi = bf2f(p[j] >> 16) * bfround(sigmoid(bf2f(q[j] >> 16)));
+          r[j] = static_cast<unsigned>(f2bf(lo)) |
+                 (static_cast<unsigned>(f2bf(hi)) << 16);
+        }
+        y[u] = o;
+      }
     }
   }
 }
 
 // ---------------------------------------------------------------------------
-// One decode step of a gated delta net layer, one token a request.
-// inputs:
-//   [0] proj bf16 [BATCH][PW]: q (NKH x D), k (NKH x D), v (2 NKH x D),
-//       z (2 NKH x D), b (2 NKH), a (2 NKH) -- the in_proj_qkv / z / b / a
-//       outputs of the normalized hidden state;
-//   [1] conv weight bf16 [4 NKH D][4] (the taps of a channel, oldest first);
-//   [2] conv state bf16 [NREQ][3][4 NKH D]: the last three inputs of a
-//       request, input t in slot t % 3;
-//   [3] recurrent state fp32 [NREQ][2 NKH][D][D] (key dim, value dim);
-//   [4] fp32 [2 NKH + 2 NKH + D]: -exp(A_log), dt_bias, the gated norm's w.
-// outputs: [0] bf16 [BATCH][2 NKH D], the layer's input to out_proj.
-// Unit = (token, key head): the head's q and k, its two value heads and their
-// states (two value heads share a key head). The request and its position come
-// from the runtime (request_ids, step) or, with XMAP (tests), from input [5],
-// int32 [BATCH][2]: position 0 starts from zero states.
+// One decode step of a gated delta net layer, a unit = (token, value head).
+// inputs: [0] proj bf16 [BATCH][PW]: q | k | v | z | b | a (q, k: NKH heads of
+// D; v, z: 2 NKH heads of D; b, a: 2 NKH) -- the in_proj_qkv / z / b / a
+// outputs of the normalized hidden state; [1] conv weight bf16 [C][4] (C =
+// 4 NKH D conv channels: q | k | v; a channel's taps, oldest first); [2] conv
+// state bf16 [NREQ][4][C], the last inputs of a request as a ring: input t in
+// slot t % 4; [3] recurrent state fp32 [NREQ][2 NKH][D][D] (key dim, value
+// dim); [4] fp32 [2 NKH + 2 NKH + D]: -exp(A_log) | dt_bias | the gated
+// norm's w. outputs: [0] bf16 [BATCH][2 NKH D], the layer's input to out_proj.
+// The request and its position come from the runtime (request_ids, step) or,
+// with XMAP (tests), from input [5], int32 [BATCH][2]: position 0 starts from
+// zero states.
+//
 // Per value head (the reference's torch_recurrent_gated_delta_rule):
 //   S <- S exp(g); kv = S^T k; delta = (v - kv) beta; S <- S + k delta^T;
 //   o = S^T q, with k, q L2-normalized and q scaled by 1 / sqrt(D).
-// The two states (D x D fp32 each) are worked on in shared memory: one bulk
-// copy in, the update, one bulk store out.
+// The head's state (D x D fp32) is copied into shared memory and read twice
+// there (S^T k and S^T q, then the update); the new state goes straight to
+// global memory. A warp owns 16 rows of the state, a lane 4 columns: a row is
+// one 16-byte access of the warp. The two value heads of a key head are two
+// units (two tasks at small batch): both do the key head's q / k conv, the
+// even one writes its conv state -- hence the ring of 4 slots, which input t
+// never reads the slot it writes.
 // ---------------------------------------------------------------------------
 template <int BATCH,
           int NREQ,
@@ -316,8 +315,9 @@ __device__ __forceinline__ void
   constexpr int NVH = 2 * NKH;
   constexpr int C = 4 * NKH * D; // conv channels: q, k, v
   constexpr int SBYTES = D * D * 4;
-  static_assert(D == 128, "a value head's D columns: 4 warps, a lane a column");
-  static_assert(PW >= C + NVH * D + 2 * NVH, "proj width");
+  constexpr int RPW = D / 8; // state rows a warp
+  static_assert(D == 128, "8 warps of 16 rows, 32 lanes of 4 columns");
+  static_assert(PW >= C + NVH * D + 2 * NVH && PW % 4 == 0, "proj width");
   const unsigned short *proj =
       static_cast<const unsigned short *>(task_desc->input_ptrs[0]);
   const unsigned short *convw =
@@ -332,55 +332,18 @@ __device__ __forceinline__ void
   extern __shared__ char shared_memory[];
   char *base = reinterpret_cast<char *>(
       (reinterpret_cast<uintptr_t>(shared_memory) + 127) / 128 * 128);
-#ifdef Q35_GDN_BAR_FIRST
-  u64 *bar = reinterpret_cast<u64 *>(base);        // the states' arrival
-  float *S = reinterpret_cast<float *>(base + 128); // [2][D][D]
-  float *kn = S + 2 * D * D;                       // [D] normalized k
-  float *qn = kn + D;                              // [D] normalized, scaled q
-  float *red = qn + D;                             // [16] reductions
-#else
-  float *S = reinterpret_cast<float *>(base);      // [2][D][D]
-  float *kn = S + 2 * D * D;                       // [D] normalized k
-  float *qn = kn + D;                              // [D] normalized, scaled q
-  float *red = qn + D;                             // [16] reductions
-  u64 *bar = reinterpret_cast<u64 *>(red + 16);    // the states' arrival
-#endif
+  float *S = reinterpret_cast<float *>(base); // [D][D]
+  float *kn = S + D * D;                      // [D] normalized k
+  float *qn = kn + D;                         // [D] normalized, scaled q
+  float *vv = qn + D;                         // [D] the value column
+  float *pm = vv + D;                         // [8 warps][2][D] partial sums
+  float *red = pm + 16 * D;                   // [16] reductions
 
   const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
-  // thread = (value head vh of the pair, column vd)
-  const int vh = tid >> 7, vd = tid & 127;
-#ifdef Q35_GDN_BULK_LOAD
-  // (Not the default: the barrier sits among this task's data, where the SM
-  // may later write back the state it holds of it -- see moe_gemm_sm100's
-  // barrier window -- and its first initialisation can lose to the states
-  // the SM still holds from the worker's last task, hence twice.)
-  if (tid == 0) {
-    mbar_init(bar, 1);
-    asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
-    mbar_init(bar, 1);
-    asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
-  }
-  __syncthreads();
-#endif
-  int loads = 0; // state copies so far: the barrier's phase
-#ifdef Q35_GDN_DEBUG
-  // tuning aid: input [5] is an int32 [workers][4] progress record
-  int *dbg = static_cast<int *>(task_desc->input_ptrs[5]) + 4 * blockIdx.x;
-#define Q35_DBG(stage)                                                         \
-  do {                                                                         \
-    if (tid == 0) {                                                            \
-      dbg[0] = task_i;                                                         \
-      dbg[1] = u;                                                              \
-      dbg[2] = (stage);                                                        \
-      dbg[3] = loads;                                                          \
-    }                                                                          \
-  } while (0)
-#else
-#define Q35_DBG(stage)
-#endif
+  const int half = tid >> 7, j = tid & 127; // conv: q + v (half 0), k (half 1)
 #pragma unroll 1
-  for (int u = task_i; u < BATCH * NKH; u += G) {
-    const int t = u / NKH, hk = u % NKH;
+  for (int u = task_i; u < BATCH * NVH; u += G) {
+    const int t = u / NVH, v = u % NVH, hk = v / 2;
     int rid, pos = 0;
     if (XMAP) {
       const int *xm = static_cast<const int *>(task_desc->input_ptrs[5]);
@@ -397,70 +360,89 @@ __device__ __forceinline__ void
     }
     const bool fresh = pos == 0;
     const unsigned short *pr = proj + static_cast<size_t>(t) * PW;
-    unsigned short *cs = cstate + static_cast<size_t>(rid) * 3 * C;
-    float *sg = sglob + (static_cast<size_t>(rid) * NVH + 2 * hk) * D * D;
+    unsigned short *cs = cstate + static_cast<size_t>(rid) * 4 * C;
+    float *sg = sglob + (static_cast<size_t>(rid) * NVH + v) * D * D;
+    const int sw = pos & 3, s0 = (pos + 1) & 3, s1 = (pos + 2) & 3,
+              s2 = (pos + 3) & 3;
 
-    // ---- the states on their way in
-#ifdef Q35_GDN_DEBUG
-    if (tid == 0 && !fresh && mxg::mbar_test(bar, loads & 1)) {
-      dbg[0] = task_i;
-      dbg[1] = u;
-      dbg[2] = 9; // the barrier's phase was over before this unit's copy
-      dbg[3] = static_cast<int>(*bar >> 32);
-      while (true) {
+    // ---- this thread's inputs first: their loads are in flight while the
+    // state's copies are issued
+    const int c0 = (half * NKH + hk) * D + j;     // q or k channel
+    const int c1 = 2 * NKH * D + v * D + j;       // value channel (half 0)
+    const unsigned short xin0 = pr[c0];
+    const uint2 w0 = reinterpret_cast<const uint2 *>(convw)[c0];
+    unsigned short xin1 = 0;
+    uint2 w1 = make_uint2(0, 0);
+    if (half == 0) {
+      xin1 = pr[c1];
+      w1 = reinterpret_cast<const uint2 *>(convw)[c1];
+    }
+    unsigned short h0[3] = {0, 0, 0}, h1[3] = {0, 0, 0};
+    if (!fresh) {
+      h0[0] = cs[s0 * C + c0];
+      h0[1] = cs[s1 * C + c0];
+      h0[2] = cs[s2 * C + c0];
+      if (half == 0) {
+        h1[0] = cs[s0 * C + c1];
+        h1[1] = cs[s1 * C + c1];
+        h1[2] = cs[s2 * C + c1];
       }
     }
-#endif
-#ifdef Q35_GDN_BULK_LOAD
-    if (tid == 0 && !fresh) {
-      mbar_expect(bar, 2 * SBYTES);
-      bulk_copy(S, sg, 2 * SBYTES, bar);
+    const unsigned short bg_raw = pr[C + NVH * D + v];
+    const unsigned short ag_raw = pr[C + NVH * D + NVH + v];
+    const float p_a = par[v], p_dt = par[NVH + v];
+    uint2 zraw = make_uint2(0, 0);
+    float4 wn = make_float4(0.f, 0.f, 0.f, 0.f);
+    if (warp == 0) {
+      zraw = *reinterpret_cast<const uint2 *>(pr + C + v * D + 4 * lane);
+      wn = *reinterpret_cast<const float4 *>(par + 2 * NVH + 4 * lane);
     }
-#else
-    // (16-byte copies of every thread, waited for by the thread itself)
     if (!fresh) {
 #pragma unroll 1
-      for (int i = tid; i < 2 * SBYTES / 16; i += blockDim.x) {
+      for (int i = tid; i < SBYTES / 16; i += blockDim.x) {
         cp_async16(reinterpret_cast<char *>(S) + 16 * i,
                    reinterpret_cast<const char *>(sg) + 16 * i);
       }
       asm volatile("cp.async.commit_group;" ::: "memory");
     }
-#endif
+    // (nothing that uses a loaded value before here: the warp would wait for
+    // it with the copies still to issue)
+    const float bg = bf2f(bg_raw), ag = bf2f(ag_raw);
 
-    // ---- causal conv + SiLU of this thread's channels: q or k (vh 0 / 1),
-    // then its value column
-    float qk, vv;
-#pragma unroll
-    for (int which = 0; which < 2; ++which) {
-      // channel: which 0 -> q (vh 0) or k (vh 1) of the key head, column vd;
-      // which 1 -> the value head 2 hk + vh, column vd
-      const int c = which == 0 ? (vh * NKH + hk) * D + vd
-                               : 2 * NKH * D + (2 * hk + vh) * D + vd;
-      const unsigned short xin = pr[c];
-      const unsigned wv[2] = {
-          reinterpret_cast<const unsigned *>(convw)[2 * c],
-          reinterpret_cast<const unsigned *>(convw)[2 * c + 1]};
-      // taps: w0 x(t-3), w1 x(t-2), w2 x(t-1), w3 x(t); x(t-3) is in the slot
-      // input t is about to take
-      float acc = bf2f(wv[1] >> 16) * bf2f(xin);
+    // ---- causal conv + SiLU: taps w0 x(t-3), w1 x(t-2), w2 x(t-1), w3 x(t)
+    float qk, vcol = 0.f;
+    {
+      float acc = bf2f(w0.y >> 16) * bf2f(xin0);
       if (!fresh) {
-        const int s0 = pos % 3, s1 = (pos + 1) % 3, s2 = (pos + 2) % 3;
-        acc += bf2f(wv[0] & 0xffff) * bf2f(cs[s0 * C + c]) +
-               bf2f(wv[0] >> 16) * bf2f(cs[s1 * C + c]) +
-               bf2f(wv[1] & 0xffff) * bf2f(cs[s2 * C + c]);
-        cs[s0 * C + c] = xin;
-      } else {
-        cs[0 * C + c] = xin;
-        cs[1 * C + c] = 0;
-        cs[2 * C + c] = 0;
+        acc += bf2f(w0.x & 0xffff) * bf2f(h0[0]) +
+               bf2f(w0.x >> 16) * bf2f(h0[1]) +
+               bf2f(w0.y & 0xffff) * bf2f(h0[2]);
       }
-      const float y = bfround(silu(bfround(acc)));
-      if (which == 0) {
-        qk = y;
-      } else {
-        vv = y;
+      qk = bfround(silu(bfround(acc)));
+      if ((v & 1) == 0) { // the key head's q / k conv state: the even head's
+        cs[sw * C + c0] = xin0;
+        if (fresh) {
+          cs[s0 * C + c0] = 0;
+          cs[s1 * C + c0] = 0;
+          cs[s2 * C + c0] = 0;
+        }
       }
+    }
+    if (half == 0) {
+      float acc = bf2f(w1.y >> 16) * bf2f(xin1);
+      if (!fresh) {
+        acc += bf2f(w1.x & 0xffff) * bf2f(h1[0]) +
+               bf2f(w1.x >> 16) * bf2f(h1[1]) +
+               bf2f(w1.y & 0xffff) * bf2f(h1[2]);
+      }
+      vcol = bfround(silu(bfround(acc)));
+      cs[sw * C + c1] = xin1;
+      if (fresh) {
+        cs[s0 * C + c1] = 0;
+        cs[s1 * C + c1] = 0;
+        cs[s2 * C + c1] = 0;
+      }
+      vv[j] = vcol;
     }
     // ---- L2 norms of q (warps 0 .. 3) and k (warps 4 .. 7)
     float ss = warp_sum(qk * qk);
@@ -469,79 +451,125 @@ __device__ __forceinline__ void
     }
     __syncthreads();
     {
-      const float tot = red[4 * vh] + red[4 * vh + 1] + red[4 * vh + 2] +
-                        red[4 * vh + 3];
+      const float tot = red[4 * half] + red[4 * half + 1] + red[4 * half + 2] +
+                        red[4 * half + 3];
       const float rs = rsqrtf(tot + 1e-6f);
-      if (vh == 0) {
-        qn[vd] = (qk * rs) * 0.08838834764831845f; // 1 / sqrt(128)
+      if (half == 0) {
+        qn[j] = (qk * rs) * 0.08838834764831845f; // 1 / sqrt(128)
       } else {
-        kn[vd] = qk * rs;
+        kn[j] = qk * rs;
       }
     }
-    // gates of this thread's value head
-    const float bg = bf2f(pr[C + NVH * D + 2 * hk + vh]);
-    const float ag = bf2f(pr[C + NVH * D + NVH + 2 * hk + vh]);
     const float beta = bfround(sigmoid(bg));
-    const float sp_in = ag + par[NVH + 2 * hk + vh];
+    const float sp_in = ag + p_dt;
     const float sp = sp_in > 20.f ? sp_in : log1pf(__expf(sp_in));
-    const float decay = __expf(par[2 * hk + vh] * sp);
-    const float zg = bf2f(pr[C + (2 * hk + vh) * D + vd]);
-    const float wnorm = par[2 * NVH + vd];
-    Q35_DBG(1);
+    const float decay = __expf(p_a * sp);
     if (!fresh) {
-#ifdef Q35_GDN_BULK_LOAD
-      mbar_wait(bar, loads & 1);
-#else
       asm volatile("cp.async.wait_group 0;" ::: "memory");
-#endif
-      ++loads;
     }
-    Q35_DBG(2);
     __syncthreads();
-    // ---- kq = k . q, and this column's S^T k, S^T q
-    float kq = warp_sum(vh == 0 ? qn[vd] * kn[vd] : 0.f);
-    if (lane == 0) {
-      red[8 + warp] = kq;
-    }
-    float *col = S + vh * D * D + vd; // S[kd][vd] at col[kd * D]
-    float m1 = 0.f, m2 = 0.f;
-    if (!fresh) {
-#pragma unroll 4
-      for (int kd = 0; kd < D; ++kd) {
-        const float s = col[kd * D];
-        m1 += s * kn[kd];
-        m2 += s * qn[kd];
+    // ---- k . q, and the partial S^T k, S^T q of this warp's rows
+    if (half == 0) {
+      const float kq = warp_sum(qn[j] * kn[j]);
+      if (lane == 0) {
+        red[8 + warp] = kq;
       }
     }
-    __syncthreads();
-    kq = red[8] + red[9] + red[10] + red[11];
-    const float delta = (vv - decay * m1) * beta;
-    const float o = bfround(decay * m2 + delta * kq);
-#pragma unroll 4
-    for (int kd = 0; kd < D; ++kd) {
-      const float s = fresh ? 0.f : col[kd * D];
-      col[kd * D] = decay * s + kn[kd] * delta;
-    }
-    // ---- gated norm of the head's output (mean over its D columns)
-    ss = warp_sum(o * o);
-    if (lane == 0) {
-      red[warp] = ss;
-    }
-    fence_async_shared();
-    __syncthreads();
+    const float4 *row = reinterpret_cast<const float4 *>(S + (RPW * warp) * D) + lane;
+    const float4 *kn4 = reinterpret_cast<const float4 *>(kn) + (RPW / 4) * warp;
+    const float4 *qn4 = reinterpret_cast<const float4 *>(qn) + (RPW / 4) * warp;
     {
-      const float tot = red[4 * vh] + red[4 * vh + 1] + red[4 * vh + 2] +
-                        red[4 * vh + 3];
-      const float n = bfround(o * rsqrtf(tot / D + eps));
-      const float y = bfround(wnorm * n) * silu(zg);
-      out[static_cast<size_t>(t) * NVH * D + (2 * hk + vh) * D + vd] = f2bf(y);
+      float4 a = make_float4(0.f, 0.f, 0.f, 0.f), b = a;
+      if (!fresh) {
+#pragma unroll
+        for (int r4 = 0; r4 < RPW / 4; ++r4) {
+          const float4 kv = kn4[r4], qv = qn4[r4];
+#pragma unroll
+          for (int q = 0; q < 4; ++q) {
+            const float4 s = row[(4 * r4 + q) * (D / 4)];
+            const float kk = q == 0 ? kv.x : q == 1 ? kv.y : q == 2 ? kv.z : kv.w;
+            const float qq = q == 0 ? qv.x : q == 1 ? qv.y : q == 2 ? qv.z : qv.w;
+            a.x += s.x * kk;
+            a.y += s.y * kk;
+            a.z += s.z * kk;
+            a.w += s.w * kk;
+            b.x += s.x * qq;
+            b.y += s.y * qq;
+            b.z += s.z * qq;
+            b.w += s.w * qq;
+          }
+        }
+      }
+      reinterpret_cast<float4 *>(pm + (2 * warp) * D)[lane] = a;
+      reinterpret_cast<float4 *>(pm + (2 * warp + 1) * D)[lane] = b;
     }
-    Q35_DBG(3);
-    if (tid == 0) {
-      bulk_store(sg, S, 2 * SBYTES);
-      bulk_store_wait();
+    __syncthreads();
+    float4 m1 = make_float4(0.f, 0.f, 0.f, 0.f), m2 = m1;
+#pragma unroll
+    for (int w = 0; w < 8; ++w) {
+      const float4 a = reinterpret_cast<const float4 *>(pm + (2 * w) * D)[lane];
+      const float4 b = reinterpret_cast<const float4 *>(pm + (2 * w + 1) * D)[lane];
+      m1.x += a.x;
+      m1.y += a.y;
+      m1.z += a.z;
+      m1.w += a.w;
+      m2.x += b.x;
+      m2.y += b.y;
+      m2.z += b.z;
+      m2.w += b.w;
     }
-    Q35_DBG(4);
+    const float kq = red[8] + red[9] + red[10] + red[11];
+    const float4 vc = reinterpret_cast<const float4 *>(vv)[lane];
+    float4 dl;
+    dl.x = (vc.x - decay * m1.x) * beta;
+    dl.y = (vc.y - decay * m1.y) * beta;
+    dl.z = (vc.z - decay * m1.z) * beta;
+    dl.w = (vc.w - decay * m1.w) * beta;
+    // ---- the new state, straight to global memory
+    {
+      float4 *grow = reinterpret_cast<float4 *>(sg + (RPW * warp) * D) + lane;
+#pragma unroll
+      for (int r4 = 0; r4 < RPW / 4; ++r4) {
+        const float4 kv = kn4[r4];
+#pragma unroll
+        for (int q = 0; q < 4; ++q) {
+          float4 s = make_float4(0.f, 0.f, 0.f, 0.f);
+          if (!fresh) {
+            s = row[(4 * r4 + q) * (D / 4)];
+          }
+          const float kk = q == 0 ? kv.x : q == 1 ? kv.y : q == 2 ? kv.z : kv.w;
+          s.x = decay * s.x + kk * dl.x;
+          s.y = decay * s.y + kk * dl.y;
+          s.z = decay * s.z + kk * dl.z;
+          s.w = decay * s.w + kk * dl.w;
+          grow[(4 * r4 + q) * (D / 4)] = s;
+        }
+      }
+    }
+    // ---- the output with its gated norm (mean over the D columns): warp 0
+    if (warp == 0) {
+      float4 o;
+      o.x = bfround(decay * m2.x + dl.x * kq);
+      o.y = bfround(decay * m2.y + dl.y * kq);
+      o.z = bfround(decay * m2.z + dl.z * kq);
+      o.w = bfround(decay * m2.w + dl.w * kq);
+      const float tot = warp_sum(o.x * o.x + o.y * o.y + o.z * o.z + o.w * o.w);
+      const float rn = rsqrtf(tot / D + eps);
+      const float z[4] = {bf2f(zraw.x & 0xffff), bf2f(zraw.x >> 16),
+                          bf2f(zraw.y & 0xffff), bf2f(zraw.y >> 16)};
+      const float ov[4] = {o.x, o.y, o.z, o.w};
+      const float wv[4] = {wn.x, wn.y, wn.z, wn.w};
+      unsigned short y[4];
+#pragma unroll
+      for (int q = 0; q < 4; ++q) {
+        const float n = bfround(ov[q] * rn);
+        y[q] = f2bf(bfround(wv[q] * n) * silu(z[q]));
+      }
+      *reinterpret_cast<uint2 *>(out + static_cast<size_t>(t) * NVH * D + v * D +
+                                 4 * lane) =
+          make_uint2(y[0] | (static_cast<unsigned>(y[1]) << 16),
+                     y[2] | (static_cast<unsigned>(y[3]) << 16));
+    }
     __syncthreads();
   }
 }

@@ -168,7 +168,7 @@ class Qwen35Builder(GraphBuilder):
                          sd[la + "norm.weight"].float()]).contiguous()
         channels = 4 * self.gdn_key_heads * self.gdn_dim
         nvh = 2 * self.gdn_key_heads
-        conv_state = torch.zeros(self.num_requests, 3, channels,
+        conv_state = torch.zeros(self.num_requests, 4, channels,
                                  dtype=torch.bfloat16, device="cuda")
         state = torch.zeros(self.num_requests, nvh, self.gdn_dim, self.gdn_dim,
                             dtype=torch.float32, device="cuda")
@@ -302,14 +302,6 @@ class Qwen35Builder(GraphBuilder):
         sin_dt = self._attach(self.sin_table, "sin_position_embedding")
         norm_dummy = self._attach(torch.ones(hd, dtype=torch.bfloat16),
                                   "qk_norm_dummy")
-        # (MPK_EXTRA_CFLAGS=-DQ35_GDN_DEBUG: a progress record of the gated
-        # delta net tasks, printed by the launch watcher on a stall)
-        self.gdn_debug = None
-        if "Q35_GDN_DEBUG" in os.environ.get("MPK_EXTRA_CFLAGS", ""):
-            self.gdn_debug_tensor = torch.zeros(mpk.num_workers, 4,
-                                                dtype=torch.int32, device="cuda")
-            self.gdn_debug = mpk.attach_input(
-                torch_tensor=self.gdn_debug_tensor, name="gdn_debug")
         # dense="gemm": every GEMM is a moe_gemm task and the workers keep
         # their TMEM across them (tmem_release_layer at the end). Not with
         # MPK's linear layers, which allocate TMEM themselves.
@@ -375,8 +367,7 @@ class Qwen35Builder(GraphBuilder):
                     self._gdn_weights(sd, p, i)
                 linear(normed, w_proj, gdn_proj, self.gdn_pw, "gdn_proj")
                 mpk.gdn_step_layer(gdn_proj, conv_w, conv_state, state, par,
-                                   gdn_out, self.gdn_key_heads, gd, eps=self.eps,
-                                   after=self.gdn_debug)
+                                   gdn_out, self.gdn_key_heads, gd, eps=self.eps)
                 mixed, w_o = gdn_out, w_out
             else:
                 w_proj, wq, wk, w_o = self._attn_weights(sd, p, i)

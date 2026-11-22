@@ -322,12 +322,15 @@ __device__ __forceinline__ void rows_sync() {
 // [2] plan meta int32 [1 + CAP + E + SHARED]: [0] the number of (expert, pass)
 // pairs, [1 ..] the pairs (expert << 16) | pass in expert order,
 // [1 + CAP + e] the token count of expert e.
-// One warp per token: every lane holds E / 32 logits.
+// One warp per token: every lane holds E / 32 logits, each as one unsigned
+// key (the value's order in the high half, 0xffff - expert in the low one), so
+// that the largest key is the largest logit, the lower expert among equals.
 // G > 1: the wave's G tasks share the tokens (one task took 5 us for every
 // eight tokens: two thirds of a millisecond a layer at batch 1024). The
 // experts' counters are then global -- input [1], int32 [E + SHARED + 1],
 // zeros between waves; its last element counts the tasks that are through
 // their tokens -- and task 0 waits for the others before it writes the plan.
+// The plan: warp w has the experts 32 w .. 32 w + 31.
 // ---------------------------------------------------------------------------
 template <int BATCH,
           int E,
@@ -356,10 +359,10 @@ __device__ __forceinline__ void
   const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
   const int nwarps = blockDim.x >> 5;
   const int task_i = static_cast<int>(task_desc->task_metadata.ext_bid_x);
-  int *cnt = G > 1 ? static_cast<int *>(task_desc->input_ptrs[1])
-                   : reinterpret_cast<int *>(
-                         (reinterpret_cast<uintptr_t>(shared_memory) + 15) /
-                         16 * 16);
+  int *sm = reinterpret_cast<int *>(
+      (reinterpret_cast<uintptr_t>(shared_memory) + 15) / 16 * 16);
+  int *tot = sm;                       // [8] plan entries of a warp's experts
+  int *cnt = G > 1 ? static_cast<int *>(task_desc->input_ptrs[1]) : sm + 8;
   if (G == 1) {
     for (int i = tid; i < E_TOT; i += blockDim.x) {
       cnt[i] = 0;
@@ -368,45 +371,54 @@ __device__ __forceinline__ void
   }
 
   for (int t = task_i * nwarps + warp; t < BATCH; t += G * nwarps) {
-    float v[VPL];
+    const unsigned short *lr = logits + static_cast<size_t>(t) * LSTRIDE;
+    unsigned raw[VPL];
+    if (VPL == 8 && LSTRIDE % 8 == 0) {
+      const uint4 v = reinterpret_cast<const uint4 *>(lr)[lane];
+      const unsigned w[4] = {v.x, v.y, v.z, v.w};
+#pragma unroll
+      for (int j = 0; j < VPL; ++j) {
+        raw[j] = (w[(j / 2) & 3] >> (16 * (j & 1))) & 0xffff;
+      }
+    } else {
+#pragma unroll
+      for (int j = 0; j < VPL; ++j) {
+        raw[j] = lr[lane * VPL + j];
+      }
+    }
+    unsigned key[VPL];
 #pragma unroll
     for (int j = 0; j < VPL; ++j) {
-      v[j] = bf2f(logits[static_cast<size_t>(t) * LSTRIDE + lane * VPL + j]);
+      unsigned b = raw[j] == 0x8000u ? 0u : raw[j]; // -0 is 0
+      b = (b & 0x8000u) ? (~b & 0xffffu) : (b | 0x8000u);
+      key[j] = (b << 16) | (0xffffu - static_cast<unsigned>(lane * VPL + j));
     }
-    float sel_val = 0.f;
-    int sel_idx = 0;
-#pragma unroll 1
+    unsigned sel = 0;
+#pragma unroll
     for (int k = 0; k < TOPK; ++k) {
-      float bv = v[0];
-      int bi = lane * VPL;
+      unsigned best = key[0];
 #pragma unroll
       for (int j = 1; j < VPL; ++j) {
-        if (v[j] > bv) {
-          bv = v[j];
-          bi = lane * VPL + j;
-        }
+        best = max(best, key[j]);
       }
-      // the largest of the warp; equal values: the lower expert
 #pragma unroll
       for (int off = 16; off > 0; off >>= 1) {
-        const float ov = __shfl_xor_sync(0xffffffffu, bv, off);
-        const int oi = __shfl_xor_sync(0xffffffffu, bi, off);
-        if (ov > bv || (ov == bv && oi < bi)) {
-          bv = ov;
-          bi = oi;
-        }
+        best = max(best, __shfl_xor_sync(0xffffffffu, best, off));
       }
       if (lane == k) {
-        sel_val = bv;
-        sel_idx = bi;
+        sel = best;
       }
 #pragma unroll
       for (int j = 0; j < VPL; ++j) {
-        if (bi == lane * VPL + j) {
-          v[j] = -3.0e38f;
+        if (key[j] == best) {
+          key[j] = 0u; // (below every key of a number)
         }
       }
     }
+    const int sel_idx = static_cast<int>(0xffffu - (sel & 0xffffu));
+    const unsigned so = sel >> 16;
+    const float sel_val = bf2f(static_cast<unsigned short>(
+        (so & 0x8000u) ? (so ^ 0x8000u) : (~so & 0xffffu)));
     const float top = __shfl_sync(0xffffffffu, sel_val, 0);
     const float ex = lane < TOPK ? __expf(sel_val - top) : 0.f;
     float sum = ex;
@@ -419,7 +431,7 @@ __device__ __forceinline__ void
       const int pos = atomicAdd(&cnt[sel_idx], 1);
       list[static_cast<size_t>(sel_idx) * BATCH + pos] = (t << 8) | lane;
     } else if (SHARED && lane == TOPK) {
-      const float g = bf2f(logits[static_cast<size_t>(t) * LSTRIDE + E]);
+      const float g = bf2f(lr[E]);
       weight[static_cast<size_t>(t) * SLOTS + TOPK] =
           bfround(1.f / (1.f + __expf(fminf(-g, 40.f))));
       list[static_cast<size_t>(E) * BATCH + t] = (t << 8) | TOPK;
@@ -441,43 +453,58 @@ __device__ __forceinline__ void
     __syncthreads();
   }
 
-  if (warp == 0) {
-    int base = 0;
-#pragma unroll 1
-    for (int e0 = 0; e0 < E_TOT; e0 += 32) {
-      const int e = e0 + lane;
-      int c = 0;
-      if (e < E) {
-        c = *reinterpret_cast<volatile int *>(&cnt[e]);
-        if (G > 1) {
-          cnt[e] = 0; // (for the next wave)
-        }
-      } else if (e < E_TOT) {
-        c = BATCH;
-      }
-      const int np = (c + NT - 1) / NT;
-      int pre = np;
-#pragma unroll
-      for (int off = 1; off < 32; off <<= 1) {
-        const int o = __shfl_up_sync(0xffffffffu, pre, off);
-        if (lane >= off) {
-          pre += o;
-        }
-      }
-      const int first = base + pre - np;
-      for (int p = 0; p < np; ++p) {
-        meta[1 + first + p] = (e << 16) | p;
-      }
-      if (e < E_TOT) {
-        meta[1 + CAP + e] = c;
-      }
-      base += __shfl_sync(0xffffffffu, pre, 31);
+  // ---- the plan: the (expert, pass) pairs in expert order, the counts
+  int c = 0, np = 0, pre = 0;
+  if (warp < VPL) {
+    const int e = 32 * warp + lane;
+    c = *reinterpret_cast<volatile int *>(&cnt[e]);
+    if (G > 1) {
+      cnt[e] = 0; // (for the next wave)
     }
-    if (lane == 0) {
-      meta[0] = base;
-      if (G > 1) {
-        cnt[E_TOT] = 0;
+    np = (c + NT - 1) / NT;
+    pre = np;
+#pragma unroll
+    for (int off = 1; off < 32; off <<= 1) {
+      const int o = __shfl_up_sync(0xffffffffu, pre, off);
+      if (lane >= off) {
+        pre += o;
       }
+    }
+    if (lane == 31) {
+      tot[warp] = pre;
+    }
+  }
+  __syncthreads();
+  int base = 0, all = 0;
+#pragma unroll
+  for (int w = 0; w < VPL; ++w) {
+    const int v = tot[w];
+    all += v;
+    if (w < warp) {
+      base += v;
+    }
+  }
+  if (warp < VPL) {
+    const int e = 32 * warp + lane;
+    const int first = base + pre - np;
+    for (int p = 0; p < np; ++p) {
+      meta[1 + first + p] = (e << 16) | p;
+    }
+    meta[1 + CAP + e] = c;
+  }
+  if (tid == 0) {
+    int n = all;
+    if (SHARED) { // the shared expert: every token, after the routed ones
+      const int nps = (BATCH + NT - 1) / NT;
+      for (int p = 0; p < nps; ++p) {
+        meta[1 + all + p] = (E << 16) | p;
+      }
+      meta[1 + CAP + E] = BATCH;
+      n += nps;
+    }
+    meta[0] = n;
+    if (G > 1) {
+      cnt[E_TOT] = 0;
     }
   }
 }
@@ -1347,45 +1374,71 @@ __device__ __forceinline__ void
 // shared expert) is added to the rounded sum of the routed ones.
 // inputs: [0] out bf16 [BATCH][SLOTS][H]; [1] w fp32 [BATCH][SLOTS];
 // [2] residual bf16 [BATCH][H]. outputs: [0] y bf16 [BATCH][H].
-// Unit = (token, 16-byte chunk of 8 columns); the wave's lanes take the units
-// round-robin (a lane's loads of one unit are in flight together; a warp
-// walking a token's chunks one after another would wait for each).
+// Unit = (token, chunk of CW columns), CW 8 (16 bytes) or 2 (4 bytes: a lane
+// has a quarter of the arithmetic, for the batches where there are lanes to
+// spare -- a chunk of 8 is about 1.5 us of a lane); the wave's lanes take the
+// units round-robin (a lane's loads of one unit are in flight together; a
+// warp walking a token's chunks one after another would wait for each).
 // ---------------------------------------------------------------------------
-template <int BATCH, int SLOTS, int H, int G, int SHARED, class TD, class RC>
+template <int BATCH,
+          int SLOTS,
+          int H,
+          int G,
+          int SHARED,
+          int CW,
+          class TD,
+          class RC>
 __device__ __forceinline__ void
     moe_combine_sm100(TD const *task_desc, RC const &runtime_config) {
   using namespace mxg;
-  constexpr int NCHUNK = H / 8;
+  constexpr int NCHUNK = H / CW;
+  constexpr int NW = CW / 2; // 32-bit words (two columns) a chunk
   constexpr int ROUTED = SLOTS - SHARED;
-  static_assert(H % 8 == 0 && SLOTS <= 16, "16 B chunks, the slots in registers");
-  const uint4 *in = static_cast<const uint4 *>(task_desc->input_ptrs[0]);
+  static_assert((CW == 8 || CW == 2) && H % 8 == 0 && SLOTS <= 16,
+                "16 B or 4 B chunks, the slots in registers");
+  const unsigned *in = static_cast<const unsigned *>(task_desc->input_ptrs[0]);
   const float *wt = static_cast<const float *>(task_desc->input_ptrs[1]);
-  const uint4 *res = static_cast<const uint4 *>(task_desc->input_ptrs[2]);
-  uint4 *y = static_cast<uint4 *>(task_desc->output_ptrs[0]);
+  const unsigned *res = static_cast<const unsigned *>(task_desc->input_ptrs[2]);
+  unsigned *y = static_cast<unsigned *>(task_desc->output_ptrs[0]);
   const int nthreads = blockDim.x;
   const int gid = static_cast<int>(task_desc->task_metadata.ext_bid_x) * nthreads +
                   threadIdx.x;
+  // a chunk's words: one load
+  auto load = [](const unsigned *p, unsigned *w) {
+    if (NW == 4) {
+      const uint4 v = *reinterpret_cast<const uint4 *>(p);
+      w[0] = v.x;
+      w[1] = v.y;
+      w[2] = v.z;
+      w[3] = v.w;
+    } else {
+      w[0] = *p;
+    }
+  };
 #pragma unroll 1
   for (int u = gid; u < BATCH * NCHUNK; u += G * nthreads) {
     const int t = u / NCHUNK, c = u % NCHUNK;
-    const uint4 *ir = in + static_cast<size_t>(t) * SLOTS * NCHUNK;
-    uint4 v[SLOTS];
+    const unsigned *ir = in + static_cast<size_t>(t) * SLOTS * (H / 2);
+    unsigned v[SLOTS][NW], rv[NW];
     float w[SLOTS];
 #pragma unroll
     for (int s = 0; s < SLOTS; ++s) {
-      v[s] = ir[s * NCHUNK + c];
+      load(ir + s * (H / 2) + c * NW, v[s]);
       w[s] = wt[static_cast<size_t>(t) * SLOTS + s];
     }
-    const uint4 rv = res[static_cast<size_t>(t) * NCHUNK + c];
-    float acc[8] = {0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
-    float sh[8] = {0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
+    load(res + static_cast<size_t>(t) * (H / 2) + c * NW, rv);
+    float acc[CW], sh[CW];
+#pragma unroll
+    for (int j = 0; j < CW; ++j) {
+      acc[j] = 0.f;
+      sh[j] = 0.f;
+    }
 #pragma unroll
     for (int s = 0; s < SLOTS; ++s) {
-      const unsigned *p = reinterpret_cast<const unsigned *>(&v[s]);
 #pragma unroll
-      for (int j = 0; j < 4; ++j) {
-        const float lo = bfround(bf2f(p[j] & 0xffff) * w[s]);
-        const float hi = bfround(bf2f(p[j] >> 16) * w[s]);
+      for (int j = 0; j < NW; ++j) {
+        const float lo = bfround(bf2f(v[s][j] & 0xffff) * w[s]);
+        const float hi = bfround(bf2f(v[s][j] >> 16) * w[s]);
         if (s < ROUTED) {
           acc[2 * j] += lo;
           acc[2 * j + 1] += hi;
@@ -1395,20 +1448,23 @@ __device__ __forceinline__ void
         }
       }
     }
-    const unsigned *q = reinterpret_cast<const unsigned *>(&rv);
-    uint4 o;
-    unsigned *r = reinterpret_cast<unsigned *>(&o);
+    unsigned r[NW];
 #pragma unroll
-    for (int j = 0; j < 4; ++j) {
+    for (int j = 0; j < NW; ++j) {
       float lo = bfround(acc[2 * j]), hi = bfround(acc[2 * j + 1]);
       if (SHARED) {
         lo = bfround(lo + sh[2 * j]);
         hi = bfround(hi + sh[2 * j + 1]);
       }
-      r[j] = static_cast<unsigned>(f2bf(bf2f(q[j] & 0xffff) + lo)) |
-             (static_cast<unsigned>(f2bf(bf2f(q[j] >> 16) + hi)) << 16);
+      r[j] = static_cast<unsigned>(f2bf(bf2f(rv[j] & 0xffff) + lo)) |
+             (static_cast<unsigned>(f2bf(bf2f(rv[j] >> 16) + hi)) << 16);
     }
-    y[static_cast<size_t>(t) * NCHUNK + c] = o;
+    unsigned *yr = y + static_cast<size_t>(t) * (H / 2) + c * NW;
+    if (NW == 4) {
+      *reinterpret_cast<uint4 *>(yr) = make_uint4(r[0], r[1], r[2], r[3]);
+    } else {
+      yr[0] = r[0];
+    }
   }
 }
 

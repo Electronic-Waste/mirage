@@ -74,7 +74,7 @@ def main():
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--gdn-tasks", type=int, default=None,
                     help="tasks of a gated delta net wave (fewer: more "
-                         "(token, head) units a task)")
+                         "(token, value head) units a task)")
     a = ap.parse_args()
     torch.manual_seed(a.seed)
     dev, bf, B = "cuda", torch.bfloat16, a.batch
@@ -107,7 +107,7 @@ def main():
                (0.3 + 2.0 * torch.rand(B, 1, device=dev))).to(bf)
               for _ in range(a.steps)]
     convw = (torch.randn(C, 4, device=dev) * 0.5).to(bf)
-    cstate = torch.zeros(B + 2, 3, C, dtype=bf, device=dev)
+    cstate = torch.zeros(B + 2, 4, C, dtype=bf, device=dev)
     sstate = torch.zeros(B + 2, NVH, D, D, dtype=torch.float32, device=dev)
     A = -(torch.rand(NVH, device=dev) * 2 - 1).exp()
     dt_bias = torch.randn(NVH, device=dev).to(bf).float()
@@ -180,7 +180,7 @@ def main():
         check(f"gdn step {step}", gout[step], ref)
     last = a.steps - 1
     serr = (sstate[rid.long()] - S).abs().max().item()
-    herr = max((cstate[rid.long(), (last - j) % 3].float() -
+    herr = max((cstate[rid.long(), (last - j) % 4].float() -
                 hist[..., 2 - j]).abs().max().item()
                for j in range(min(3, a.steps)))
     print(f"[gdn states] recurrent max |kernel - reference| = {serr:.6f} "

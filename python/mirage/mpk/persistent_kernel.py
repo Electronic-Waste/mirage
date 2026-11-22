@@ -2663,13 +2663,15 @@ class PersistentKernel:
         """
         assert self.target_cc in (100, 103)
         batch, slots, h = input.dim(0), input.dim(1), input.dim(2)
-        # a lane takes one 8-column chunk at a time
-        g = min(self.num_workers, (batch * (h // 8) + 255) // 256)
+        # a lane takes one chunk at a time: 2 columns while the workers have
+        # a lane for each, 8 columns otherwise
+        cw = 2 if batch * (h // 2) <= self.num_workers * 256 else 8
+        g = min(self.num_workers, (batch * (h // cw) + 255) // 256)
         if num_tasks is not None:
             g = num_tasks
         self.ext_layer("moe_combine_sm100", [input, weight, residual],
                        [output], (g, 1, 1),
-                       [batch, slots, h, g, 1 if shared else 0])
+                       [batch, slots, h, g, 1 if shared else 0, cw])
 
     # ---- Qwen3.5's tasks (tasks/blackwell/qwen35_sm100.cuh) ----
     @staticmethod
@@ -2714,7 +2716,10 @@ class PersistentKernel:
         """output = input * sigmoid(proj[:, gate_offset:]), [batch, W] bf16."""
         batch, w = input.dim(0), input.dim(1)
         assert proj.dim(1) >= gate_offset + w
-        g = self._token_tasks(batch, num_tasks)
+        # a lane takes one 8-column chunk at a time
+        g = min(self.num_workers, (batch * (w // 8) + 255) // 256)
+        if num_tasks is not None:
+            g = num_tasks
         self.ext_layer("gate_mul_sm100", [input, proj], [output], (g, 1, 1),
                        [batch, w, proj.dim(1), gate_offset, g])
 
@@ -2726,16 +2731,19 @@ class PersistentKernel:
         """One decode step of a gated delta net layer (one token a request).
 
         proj [batch, >= q | k | v | z | b | a] bf16, conv_weight [channels, 4]
-        bf16, conv_state [requests, 3, channels] bf16, state [requests,
-        2 * key heads, D, D] float32, params float32 [-exp(A_log), dt_bias,
-        norm weight], output [batch, 2 * key heads * D] bf16. request_map
-        int32 [batch, 2] = (request, position) replaces the runtime's (tests);
-        `after` is a tensor the layer only waits for (two layers that share
-        states and nothing else have no order otherwise).
+        bf16, conv_state [requests, 4, channels] bf16 (a ring: input t in
+        slot t % 4), state [requests, 2 * key heads, D, D] float32, params
+        float32 [-exp(A_log), dt_bias, norm weight], output [batch, 2 * key
+        heads * D] bf16. request_map int32 [batch, 2] = (request, position)
+        replaces the runtime's (tests); `after` is a tensor the layer only
+        waits for (two layers that share states and nothing else have no
+        order otherwise).
         """
         batch = proj.dim(0)
         nreq = state.dim(0)
-        g = min(self.num_workers, batch * num_key_heads)
+        assert conv_state.dim(1) == 4
+        # a task a (token, value head) while there are workers for them
+        g = min(self.num_workers, batch * 2 * num_key_heads)
         if num_tasks is not None:
             g = num_tasks
         inputs = [proj, conv_weight, conv_state, state, params]
