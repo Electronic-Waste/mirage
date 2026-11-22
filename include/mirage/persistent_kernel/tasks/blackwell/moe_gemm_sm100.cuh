@@ -466,8 +466,16 @@ __device__ __forceinline__ void
 // [BATCH][OSTRIDE]; the output is bf16 [BATCH][OSTRIDE]. FUSE rounds
 // product + bias once (a linear layer) instead of the product first (the
 // experts' bmm, then the bias); the residual is added to the rounded value.
-// HELD: the worker holds its TMEM for the whole iteration (tmem_hold_sm100 /
-// tmem_release_sm100) instead of this task allocating and freeing it.
+// HELD: the worker keeps its TMEM from task to task (tmem_release_sm100 at
+// the end of the iteration) instead of this task allocating and freeing it;
+// its last input but two is the token tensor.
+// KS > 1 splits every unit's K steps into KS parts that are units of their
+// own, so a wave with fewer units than workers runs chains of K / (16 KS)
+// MMAs side by side instead of K / 16 on some workers and nothing on the
+// rest. A part's accumulator goes to a scratch tensor (the last input but
+// one, fp32 [units][KS][128][NT]); whichever part of a unit finishes last
+// (a counter per unit and row quadrant, the last input, int32 [units][4])
+// adds the parts in order and runs the epilogue.
 // Warps: 0 .. 3 the 128 rows (dequantization, epilogue), 4 the weight copies,
 // 5 the MMAs, 6 .. 7 the activation gather.
 // ---------------------------------------------------------------------------
@@ -492,6 +500,7 @@ template <int MX,
           int FUSE,
           int HELD,
           int OSTRIDE,
+          int KS,
           class TD,
           class RC>
 __device__ __forceinline__ void
@@ -555,8 +564,11 @@ __device__ __forceinline__ void
   // barrier at all: 15 commits a unit less, and the next unit's activations
   // are in before its first weights are.
   constexpr int A_MIN = MX ? 4 * ABLK : 2 * ABLK;
-  constexpr bool B2X =
-      2 * NKB * BSTG + A_MIN + 8192 <= SMEM_TOTAL && STGB_1 == NKB;
+  // (With KS parts a unit, a task's units must all be the same part -- G a
+  // multiple of KS -- for a stage to be used once every other unit, which
+  // the parity of its barrier counts on.)
+  constexpr bool B2X = 2 * NKB * BSTG + A_MIN + 8192 <= SMEM_TOTAL &&
+                       STGB_1 == NKB && (KS == 1 || G % KS == 0);
   constexpr int STGB = B2X ? 2 * NKB : STGB_1;
   constexpr int STG_B2X = (SMEM_TOTAL - 8192 - 2 * NKB * BSTG) / ABLK;
   constexpr int STG = B2X ? (STG_B2X > STG_MAX ? STG_MAX : STG_B2X) : STG_0;
@@ -589,6 +601,13 @@ __device__ __forceinline__ void
   constexpr int NPASS = (BATCH + NT - 1) / NT;
   static_assert(!DENSE || (E_TOT == 1 && SLOTS == 1 && !IN_SLOTTED), "dense");
   static_assert(!RES || !ACT, "a residual goes with a plain output");
+  static_assert(KS >= 1 && KS <= NKB, "parts of a unit's K steps");
+  constexpr int IDX_TOK = IDX_RES + RES + MXG_TRACE_INPUTS;
+  constexpr int IDX_PART = IDX_TOK + HELD;
+  float *kpart = KS > 1 ? static_cast<float *>(task_desc->input_ptrs[IDX_PART])
+                        : nullptr;
+  int *kcnt = KS > 1 ? static_cast<int *>(task_desc->input_ptrs[IDX_PART + 1])
+                     : nullptr;
   const int *rlist =
       DENSE ? nullptr : static_cast<const int *>(task_desc->input_ptrs[2]);
   const int *meta =
@@ -655,7 +674,7 @@ __device__ __forceinline__ void
     __syncthreads();
     n_ep = misc[0];
   }
-  const int total = n_ep * RB;
+  const int total = n_ep * RB * KS;
   const int n_my = total > task_i ? (total - task_i - 1) / G + 1 : 0;
   if (!DENSE && n_my > MAXU) {
     __trap();
@@ -671,7 +690,7 @@ __device__ __forceinline__ void
   }
 #endif
   if (!DENSE && tid < n_my) {
-    const int u = task_i + tid * G;
+    const int u = (task_i + tid * G) / KS;
     const int ent = meta[1 + u / RB];
     const int e = ent >> 16, p = ent & 0xffff;
     const int left = meta[1 + CAP + e] - p * NT;
@@ -685,7 +704,7 @@ __device__ __forceinline__ void
   // to the release wave.
   int *held_tok =
       HELD ? static_cast<int *>(
-                 task_desc->input_ptrs[IDX_RES + RES + MXG_TRACE_INPUTS]) +
+                 task_desc->input_ptrs[IDX_TOK]) +
                  blockIdx.x
            : nullptr;
   // The window holds the last GEMM task's barriers, and the SM its states of
@@ -741,7 +760,7 @@ __device__ __forceinline__ void
   // unit j of this task: expert, pass, row block, tokens
   auto unit_at = [&](int j, int &e, int &p, int &rb, int &n) {
     if (DENSE) {
-      const int u = task_i + j * G;
+      const int u = (task_i + j * G) / KS;
       e = 0;
       p = u / RB;
       rb = u % RB;
@@ -753,6 +772,14 @@ __device__ __forceinline__ void
       rb = ut[j * 4 + 2];
       n = ut[j * 4 + 3];
     }
+  };
+  // unit j is part q of unit uid: the K steps [kb0, kb1)
+  auto part_at = [&](int j, int &q, int &uid, int &kb0, int &kb1) {
+    const int su = task_i + j * G;
+    q = su % KS;
+    uid = su / KS;
+    kb0 = q * NKB / KS;
+    kb1 = (q + 1) * NKB / KS;
   };
   // entry ci of a pass's token list: (token << 8) | slot
   auto entry_at = [&](const int *el, int p, int ci) {
@@ -780,8 +807,55 @@ __device__ __forceinline__ void
       const int st = j % AS;
       tmem_fence_after();
       const int nr = n > 16 ? (n + 15) & ~15 : 16;
+      int pq, uid, kb0_, kb1_;
+      part_at(j, pq, uid, kb0_, kb1_);
+      // this warp's rows of the unit's parts: [KS][32 rows][NT] in the scratch
+      float *prow = KS > 1 ? kpart + ((static_cast<size_t>(uid) * KS) * 128 +
+                                      row) * NT
+                           : nullptr;
+      bool finish = true;
+      if (KS > 1) {
 #pragma unroll 1
-      for (int c0 = 0; c0 < nr; c0 += 16) {
+        for (int c0 = 0; c0 < nr; c0 += 16) {
+          unsigned r[16];
+          float pa[16];
+          tmem_ld16(tb + st * ACC_COLS + c0 + qrow, r);
+#pragma unroll
+          for (int c = 0; c < 16; ++c) {
+            pa[c] = __uint_as_float(r[c]);
+          }
+#pragma unroll
+          for (int a = 1; a < NACC; ++a) {
+            tmem_ld16(tb + st * ACC_COLS + a * NT + c0 + qrow, r);
+#pragma unroll
+            for (int c = 0; c < 16; ++c) {
+              pa[c] += __uint_as_float(r[c]);
+            }
+          }
+#pragma unroll
+          for (int c4 = 0; c4 < 4; ++c4) {
+            *reinterpret_cast<float4 *>(prow + static_cast<size_t>(pq) * 128 * NT +
+                                        c0 + 4 * c4) =
+                make_float4(pa[4 * c4], pa[4 * c4 + 1], pa[4 * c4 + 2],
+                            pa[4 * c4 + 3]);
+          }
+        }
+        __threadfence();
+        int arrived = 0;
+        if (lane == 0) {
+          arrived = atomicAdd(&kcnt[uid * 4 + q], 1);
+        }
+        arrived = __shfl_sync(0xffffffffu, arrived, 0);
+        finish = arrived == KS - 1;
+        if (finish) {
+          __threadfence();
+          if (lane == 0) {
+            kcnt[uid * 4 + q] = 0;
+          }
+        }
+      }
+#pragma unroll 1
+      for (int c0 = 0; finish && c0 < nr; c0 += 16) {
         unsigned r[16];
         float acc[16];
         tmem_ld16(tb + st * ACC_COLS + c0 + qrow, r);
@@ -795,6 +869,37 @@ __device__ __forceinline__ void
 #pragma unroll
           for (int c = 0; c < 16; ++c) {
             acc[c] += __uint_as_float(r[c]);
+          }
+        }
+        if (KS > 1) {
+          // the unit's parts in order, this one from its accumulator
+          float sum[16];
+#pragma unroll
+          for (int c = 0; c < 16; ++c) {
+            sum[c] = 0.f;
+          }
+#pragma unroll 1
+          for (int o = 0; o < KS; ++o) {
+            if (o == pq) {
+#pragma unroll
+              for (int c = 0; c < 16; ++c) {
+                sum[c] += acc[c];
+              }
+            } else {
+#pragma unroll
+              for (int c4 = 0; c4 < 4; ++c4) {
+                const float4 v = *reinterpret_cast<const float4 *>(
+                    prow + static_cast<size_t>(o) * 128 * NT + c0 + 4 * c4);
+                sum[4 * c4] += v.x;
+                sum[4 * c4 + 1] += v.y;
+                sum[4 * c4 + 2] += v.z;
+                sum[4 * c4 + 3] += v.w;
+              }
+            }
+          }
+#pragma unroll
+          for (int c = 0; c < 16; ++c) {
+            acc[c] = sum[c];
           }
         }
         // (a loop, not 16 copies: the epilogue runs once a unit, and code
@@ -869,9 +974,11 @@ __device__ __forceinline__ void
       }
       long long tr_x = 0, tr_e = 0;
 #endif
+      int pq, uid_, kb0, kb1;
+      part_at(j, pq, uid_, kb0, kb1);
       if (MX) {
 #pragma unroll 1
-        for (int kb = 0; kb < NKB; ++kb, ++gs) {
+        for (int kb = kb0; kb < kb1; ++kb, ++gs) {
           if (epi < j && mbar_test(&acc_full[epi % AS], (epi / AS) & 1)) {
             epilogue(epi);
             ++epi;
@@ -884,7 +991,7 @@ __device__ __forceinline__ void
 #ifdef MXG_TRACE
           const long long tw1 = mxg_now();
           tr_x += tw1 - tw0;
-          if (tid == 0 && kb == 0 && j < 4) {
+          if (tid == 0 && kb == kb0 && j < 4) {
             MXG_T(8 + 12 * j + 1);
           }
           if (tid == 0) {
@@ -994,8 +1101,10 @@ __device__ __forceinline__ void
         unit_at(j, e, p_, rb, n_);
         const char *src =
             wpack + static_cast<size_t>(e * RB + rb) * NKB * ABLK;
+        int pq, uid_, kb0, kb1;
+        part_at(j, pq, uid_, kb0, kb1);
 #pragma unroll 1
-        for (int kb = 0; kb < NKB; ++kb, ++gs) {
+        for (int kb = kb0; kb < kb1; ++kb, ++gs) {
           const int s = gs % STG;
           if (gs >= STG) {
             mbar_wait(&x_empty[s], ((gs / STG) - 1) & 1);
@@ -1029,8 +1138,10 @@ __device__ __forceinline__ void
 #ifdef MXG_TRACE
         long long tr_b = 0, tr_a = 0, tr_i = 0, tr_c = 0;
 #endif
+        int pq, uid_, kb0, kb1;
+        part_at(j, pq, uid_, kb0, kb1);
 #pragma unroll 1
-        for (int kb = 0; kb < NKB; ++kb, ++gs) {
+        for (int kb = kb0; kb < kb1; ++kb, ++gs) {
           const int bs = B2X ? (j & 1) * NKB + kb : gs % STGB, sa = gs % SA;
 #ifdef MXG_TRACE
           const long long tw0 = mxg_now();
@@ -1059,8 +1170,8 @@ __device__ __forceinline__ void
               static_assert(!MMA2 || NACC == 2, "an accumulator a thread");
               const int kk = MMA2 ? 2 * k2 + half : k2;
               const int accf =
-                  MMA2 ? ((kb > 0 || b > 0 || k2 > 0) ? 1 : 0)
-                       : ((kb > 0 || b * 4 + kk >= NACC) ? 1 : 0);
+                  MMA2 ? ((kb > kb0 || b > 0 || k2 > 0) ? 1 : 0)
+                       : ((kb > kb0 || b * 4 + kk >= NACC) ? 1 : 0);
               const unsigned tdm =
                   td + (MMA2 ? half : (b * 4 + kk) % NACC) * NT;
 #ifdef MXG_ABL_NO_MMA
@@ -1148,8 +1259,10 @@ __device__ __forceinline__ void
         // unit j - 2's MMAs are over: its stages are this unit's
         mbar_wait(&acc_full[j % AS], ((j - 2) / AS) & 1);
       }
+      int pq, uid_, kb0, kb1;
+      part_at(j, pq, uid_, kb0, kb1);
 #pragma unroll 1
-      for (int kb = 0; kb < NKB; ++kb, ++gs) {
+      for (int kb = kb0; kb < kb1; ++kb, ++gs) {
         const int bs = B2X ? (j & 1) * NKB + kb : gs % STGB;
         if (!B2X && gs >= STGB) {
           mbar_wait(&b_empty[bs], ((gs / STGB) - 1) & 1);

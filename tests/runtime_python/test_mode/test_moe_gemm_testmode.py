@@ -37,6 +37,8 @@ def main():
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--skew", type=float, default=0.0,
                     help="bias the router towards the first experts")
+    ap.add_argument("--ksplit", type=int, default=1,
+                    help="parts of a unit's K steps (at most its steps)")
     a = ap.parse_args()
 
     torch.manual_seed(a.seed)
@@ -110,6 +112,34 @@ def main():
                      pk.attach_input(rlist, name="route_list"),
                      pk.attach_input(rmeta, name="route_meta"))
     d_act = pk.attach_input(act, name="act")
+    # ---- split K: every layer's units in up to --ksplit parts, one scratch
+    DR = 2 * H - 64                      # the dense layer's rows
+    kb_mx = (lambda k: moe_pack.mxfp4_step(k)) if mx else (lambda k: None)
+    ks13 = min(a.ksplit, pk.gemm_steps(H, B, kb_mx(H)))
+    ks2 = min(a.ksplit, pk.gemm_steps(I, B, kb_mx(I)))
+    ksd = min(a.ksplit, pk.gemm_steps(H, B))
+    scratch = scratch_d = None
+    if max(ks13, ks2, ksd) > 1:
+        cap = moe_pack.moe_plan_cap(B, E_TOT, SLOTS, nt)
+        # (one scratch for W13 and W2, which run one after the other; the
+        # dense layer depends on neither and runs next to them: its own)
+        sizes = [pk.gemm_scratch_size(cap * ((2 * I + 127) // 128), ks13, nt),
+                 pk.gemm_scratch_size(cap * ((H + 127) // 128), ks2, nt)]
+        sized = pk.gemm_scratch_size(((B + nt - 1) // nt) * ((DR + 127) // 128),
+                                     ksd, nt)
+        ks_parts = torch.zeros(max(1, max(v[0] for v in sizes)),
+                               dtype=torch.float32, device=dev)
+        ks_counts = torch.zeros(max(1, max(v[1] for v in sizes)),
+                                dtype=torch.int32, device=dev)
+        scratch = (pk.attach_input(ks_parts, name="gemm_parts"),
+                   pk.attach_input(ks_counts, name="gemm_part_counts"))
+        scratch_d = (
+            pk.attach_input(torch.zeros(max(1, sized[0]), dtype=torch.float32,
+                                        device=dev), name="gemm_parts_dense"),
+            pk.attach_input(torch.zeros(max(1, sized[1]), dtype=torch.int32,
+                                        device=dev),
+                            name="gemm_part_counts_dense"))
+        print(f"[ksplit] w13 {ks13}, w2 {ks2}, dense {ksd}")
     pk.moe_route_layer(
         logits=d_logits, weight=d_w,
         route_list=d_l, route_meta=d_m, nt=nt, num_experts=E,
@@ -119,13 +149,15 @@ def main():
         weight=pk.attach_input(w13p, name="w13"), route_list=d_l,
         route_meta=d_m, output=d_act, nt=nt, mxfp4=mx, rows=2 * I,
         act=(limit, alpha, off),
-        bias=pk.attach_input(b13, name="b13") if mx else None, tmem=d_tok)
+        bias=pk.attach_input(b13, name="b13") if mx else None, tmem=d_tok,
+        ksplit=ks13, scratch=scratch)
     pk.moe_gemm_layer(
         input=d_act, weight=pk.attach_input(w2p, name="w2"), route_list=d_l,
         route_meta=d_m, output=(d_out := pk.attach_input(out, name="out")),
         nt=nt,
         mxfp4=mx, rows=H,
-        bias=pk.attach_input(b2, name="b2") if mx else None, tmem=d_tok)
+        bias=pk.attach_input(b2, name="b2") if mx else None, tmem=d_tok,
+        ksplit=ks2, scratch=scratch)
 
     residual = (torch.randn(B, H, device=dev) * 0.5).to(bf)
     comb = torch.zeros(B, H, dtype=bf, device=dev)
@@ -137,7 +169,7 @@ def main():
 
     # ---- a dense linear layer on the same task: bias, residual, and the
     # workers holding their TMEM across the wave
-    DR = 2 * H - 64                      # rows: not a multiple of 128
+    # (DR rows: not a multiple of 128)
     wd = (torch.randn(1, DR, H, device=dev) * 0.05).to(bf)
     bd = (torch.randn(DR, device=dev) * 0.2).to(bf)
     rd = (torch.randn(B, DR + 64, device=dev) * 0.5).to(bf)
@@ -147,7 +179,8 @@ def main():
     pk.dense_gemm_layer(
         input=d_x2, weight=pk.attach_input(moe_pack.pack_bf16_tiles(wd), name="w_dense"),
         output=d_yd, rows=DR, bias=pk.attach_input(bd, name="b_dense"),
-        residual=pk.attach_input(rd, name="r_dense"), tmem=d_tok)
+        residual=pk.attach_input(rd, name="r_dense"), tmem=d_tok,
+        ksplit=ksd, scratch=scratch_d if scratch is not None else None)
     # ---- a small linear layer summed by threads
     ws = (torch.randn(40, H, device=dev) * 0.05).to(bf)
     bs = (torch.randn(40, device=dev) * 0.2).to(bf)

@@ -295,6 +295,23 @@ class Qwen35Builder(GraphBuilder):
         # them (tmem_release_layer at the end)
         tmem = self._attach(torch.zeros(mpk.num_workers, dtype=torch.int32),
                             "tmem_token")
+        # at small batches a wave has fewer units than workers: split every
+        # unit's K steps (moe_gemm's KS) so that all of them work
+        nt = self.moe_nt
+        npass = (mbt + nt - 1) // nt
+        active = min(e_tot, mbt * slots)
+        rb = lambda rows: (rows + 127) // 128
+        ks, scratch = mpk.gemm_split_plans({
+            "gdn_proj": (npass * rb(self.gdn_pw), mpk.gemm_steps(h, mbt),
+                         npass * rb(self.gdn_pw)),
+            "attn_proj": (npass * rb(self.attn_pw), mpk.gemm_steps(h, mbt),
+                          npass * rb(self.attn_pw)),
+            "out": (npass * rb(h), mpk.gemm_steps(nvh * gd, mbt), npass * rb(h)),
+            "w13": (active * rb(2 * self.moe_inter), mpk.gemm_steps(h, mbt),
+                    cap * rb(2 * self.moe_inter)),
+            "w2": (active * rb(h), mpk.gemm_steps(self.moe_inter, mbt),
+                   cap * rb(h)),
+        }, nt)
 
         mpk.embed_layer(
             input=x, weight=self._attach(sd["embed_tokens.weight"], "embed_tokens"),
@@ -313,7 +330,8 @@ class Qwen35Builder(GraphBuilder):
                     self._gdn_weights(sd, p, i)
                 mpk.dense_gemm_layer(input=normed, weight=w_proj,
                                      output=gdn_proj, rows=self.gdn_pw,
-                                     tmem=tmem)
+                                     tmem=tmem, ksplit=ks["gdn_proj"],
+                                     scratch=scratch)
                 mpk.gdn_step_layer(gdn_proj, conv_w, conv_state, state, par,
                                    gdn_out, self.gdn_key_heads, gd, eps=self.eps,
                                    after=self.gdn_debug)
@@ -322,7 +340,8 @@ class Qwen35Builder(GraphBuilder):
                 w_proj, wq, wk, w_o = self._attn_weights(sd, p, i)
                 mpk.dense_gemm_layer(input=normed, weight=w_proj,
                                      output=attn_proj, rows=self.attn_pw,
-                                     tmem=tmem)
+                                     tmem=tmem, ksplit=ks["attn_proj"],
+                                     scratch=scratch)
                 mpk.qsa_prep_layer(attn_proj, wq, wk, attn_in,
                                    self.num_kv_heads, self.q_per_kv, hd,
                                    eps=self.eps)
@@ -350,7 +369,8 @@ class Qwen35Builder(GraphBuilder):
                 mpk.gate_mul_layer(attn_out, attn_proj, self.qkv_size, attn_gated)
                 mixed = attn_gated
             mpk.dense_gemm_layer(input=mixed, weight=w_o, residual=x,
-                                 output=mixer_out, rows=h, tmem=tmem)
+                                 output=mixer_out, rows=h, tmem=tmem,
+                                 ksplit=ks["out"], scratch=scratch)
             x = mixer_out
 
             w_router, w13, w2 = self._moe_weights(sd, p, i)
@@ -372,11 +392,12 @@ class Qwen35Builder(GraphBuilder):
                 input=normed, weight=w13, route_list=route_list,
                 route_meta=route_meta, output=act, nt=self.moe_nt, mxfp4=False,
                 rows=2 * self.moe_inter, act=(float("inf"), 1.0, 0.0),
-                tmem=tmem)
+                tmem=tmem, ksplit=ks["w13"], scratch=scratch)
             mpk.moe_gemm_layer(
                 input=act, weight=w2, route_list=route_list,
                 route_meta=route_meta, output=mlp_out, nt=self.moe_nt,
-                mxfp4=False, rows=h, tmem=tmem)
+                mxfp4=False, rows=h, tmem=tmem, ksplit=ks["w2"],
+                scratch=scratch)
             mpk.moe_combine_layer(input=mlp_out, weight=weight, residual=x,
                                   output=layer_out, shared=True)
             x = layer_out

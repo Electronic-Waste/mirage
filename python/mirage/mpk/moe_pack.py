@@ -3,8 +3,17 @@
 
 import torch
 
-# Columns of one MXFP4 weight block (one bulk copy of the kernel).
-MXFP4_KB = 192
+
+def mxfp4_step(k: int) -> int:
+    """Columns of one MXFP4 weight block (one bulk copy, one step of the
+    kernel) for K columns: every step costs the kernel a quarter microsecond
+    of waits whatever its size, so the widest that divides K and still leaves
+    two A stages in TMEM (160 columns each at 320)."""
+    for kb in (320, 192, 64):
+        if k % kb == 0:
+            return kb
+    raise ValueError(f"K = {k} is not a multiple of 64")
+
 # Block scales the kernel converts exactly: every e2m1 value times
 # 2^(s - 127) and 2^(s - 15) must be normal bf16 numbers.
 MXFP4_SCALE_MIN, MXFP4_SCALE_MAX = 2, 142
@@ -34,7 +43,7 @@ def moe_plan_tensors(batch: int, num_experts: int, slots: int, nt: int,
 
 
 def pack_mxfp4(blocks: torch.Tensor, scales: torch.Tensor,
-               kb: int = MXFP4_KB) -> torch.Tensor:
+               kb: int = None) -> torch.Tensor:
     """MXFP4 expert weights as released -> the kernel's blocks.
 
     blocks uint8 [E, R, K / 32, 16] (32 e2m1 values a group, the low nibble
@@ -47,6 +56,8 @@ def pack_mxfp4(blocks: torch.Tensor, scales: torch.Tensor,
     e, r, groups, nbytes = blocks.shape
     assert nbytes == 16 and scales.shape == (e, r, groups)
     k = groups * 32
+    if kb is None:
+        kb = mxfp4_step(k)
     assert kb % 64 == 0 and k % kb == 0, (k, kb)
     lo, hi = int(scales.min()), int(scales.max())
     if lo < MXFP4_SCALE_MIN or hi > MXFP4_SCALE_MAX:

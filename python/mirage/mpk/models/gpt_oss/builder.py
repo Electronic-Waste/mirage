@@ -248,10 +248,31 @@ class GptOssBuilder(GraphBuilder):
         # plan mode: every GEMM is a moe_gemm task and the workers keep
         # their TMEM across them (tmem_release_layer at the end)
         self.tmem = None
+        self.ks, self.scratch = {}, None
         if self.moe == "plan":
             self.tmem = self._attach(
                 torch.zeros(self.mpk.num_workers, dtype=torch.int32),
                 "tmem_token")
+            # at small batches a wave has fewer units than workers: split
+            # every unit's K steps (moe_gemm's KS) so that all of them work
+            mpk, nt = self.mpk, moe_pack.moe_tokens_per_pass(mbt)
+            npass = (mbt + nt - 1) // nt
+            cap = moe_pack.moe_plan_cap(mbt, self.num_experts,
+                                        self.num_experts_per_tok, nt)
+            active = min(self.num_experts, mbt * self.num_experts_per_tok)
+            hh, ii2 = self.hidden_size, self.intermediate_size
+            rb13, rb2 = (2 * ii2 + 127) // 128, (hh + 127) // 128
+            rbq, rbo = (self.fused_qkv_size + 127) // 128, (hh + 127) // 128
+            mx_kb = (lambda k: moe_pack.mxfp4_step(k)) if self.mxfp4 \
+                else (lambda k: None)
+            self.ks, self.scratch = mpk.gemm_split_plans({
+                "w13": (active * rb13, mpk.gemm_steps(hh, mbt, mx_kb(hh)), cap * rb13),
+                "w2": (active * rb2, mpk.gemm_steps(ii2, mbt, mx_kb(ii2)), cap * rb2),
+                "qkv": (npass * rbq, mpk.gemm_steps(hh, mbt), npass * rbq),
+                "o": (npass * rbo,
+                      mpk.gemm_steps(self.num_q_heads * self.head_dim, mbt),
+                      npass * rbo),
+            }, nt)
         self.cos_dt = self._attach(self.cos_table, "cos_position_embedding")
         self.sin_dt = self._attach(self.sin_table, "sin_position_embedding")
         # GPT-OSS has no QK-norm; the kernel still takes the two operands.
@@ -374,7 +395,8 @@ class GptOssBuilder(GraphBuilder):
                 self.mpk.dense_gemm_layer(
                     input=self.rmsnorm_out, weight=w_qkv, bias=b_qkv,
                     output=self.attn_in, rows=self.fused_qkv_size,
-                    tmem=self.tmem)
+                    tmem=self.tmem, ksplit=self.ks["qkv"],
+                    scratch=self.scratch)
             else:
                 self.mpk.linear_layer(
                     input=self.rmsnorm_out, weight=w_qkv, bias=b_qkv,
@@ -424,7 +446,7 @@ class GptOssBuilder(GraphBuilder):
                     bias=self._attach(sd[f"{prefix}self_attn.o_proj.bias"],
                                       f"layer_{i}_o_bias"),
                     residual=self.x, output=self.attn_biased_out, rows=h,
-                    tmem=self.tmem)
+                    tmem=self.tmem, ksplit=self.ks["o"], scratch=self.scratch)
             else:
                 self.mpk.linear_with_residual_layer(
                     input=self.attn_out,
@@ -485,12 +507,14 @@ class GptOssBuilder(GraphBuilder):
                     route_list=self.routing_indices,
                     route_meta=self.route_meta, output=self.swiglu_out,
                     nt=self.moe_nt, mxfp4=self.mxfp4, rows=2 * ii,
-                    act=(self.swiglu_limit, 1.702, 1.0), tmem=self.tmem)
+                    act=(self.swiglu_limit, 1.702, 1.0), tmem=self.tmem,
+                    ksplit=self.ks["w13"], scratch=self.scratch)
                 self.mpk.moe_gemm_layer(
                     input=self.swiglu_out, weight=w2, bias=b2,
                     route_list=self.routing_indices,
                     route_meta=self.route_meta, output=self.mlp_out,
-                    nt=self.moe_nt, mxfp4=self.mxfp4, rows=h, tmem=self.tmem)
+                    nt=self.moe_nt, mxfp4=self.mxfp4, rows=h, tmem=self.tmem,
+                    ksplit=self.ks["w2"], scratch=self.scratch)
             else:
                 self.mpk.moe_topk_softmax_routing_layer(
                     input=self.gate_out,

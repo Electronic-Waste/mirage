@@ -2416,6 +2416,8 @@ class PersistentKernel:
         num_tasks: int = None,
         trace: DTensor = None,
         tmem: DTensor = None,
+        ksplit: int = 1,
+        scratch: tuple = None,
     ):
         """One wave of an expert GEMM over a route plan.
 
@@ -2444,7 +2446,6 @@ class PersistentKernel:
         assert output.dim(0) == batch
         assert output.dim(2) == (rows // 2 if act is not None else rows)
         assert route_meta.dim(0) == 1 + cap + e_tot
-        assert (cap * rb + g - 1) // g <= 64, "too many units per task"
         limit, alpha, off = act if act is not None else (0.0, 0.0, 0.0)
         bits = [struct.unpack("<i", struct.pack("<f", v))[0]
                 for v in (limit, alpha, off)]
@@ -2456,13 +2457,21 @@ class PersistentKernel:
             # int64 [workers, 256] time stamps; needs -DMXG_TRACE (tuning aid)
             inputs.append(trace)
         if tmem is not None:
-            inputs.append(tmem)  # (tmem_hold_layer's token: order only)
+            inputs.append(tmem)  # the held TMEM's token (tmem_release_layer)
+        assert (cap * rb * ksplit + g - 1) // g <= 64, "too many units per task"
+        if ksplit > 1:
+            # ksplit parts a unit (gemm_ksplit); scratch = (float32
+            # [>= gemm_scratch_size()[0]], int32 zeros [>= ...[1]])
+            need = self.gemm_scratch_size(cap * rb, ksplit, nt)
+            assert scratch is not None and scratch[0].dim(0) >= need[0] \
+                and scratch[1].dim(0) >= need[1], "gemm scratch too small"
+            inputs += [scratch[0], scratch[1]]
         self.ext_layer(
             "moe_gemm_sm100", inputs, [output], (g, 1, 1),
             [1 if mxfp4 else 0, 0 if act is None else 1,
              0 if bias is None else 1, 1 if slotted else 0,
              batch, e_tot, slots, nt, k, rows, kb, g, cap] + bits +
-            [0, 0, 0, 0 if tmem is None else 1, 0])
+            [0, 0, 0, 0 if tmem is None else 1, 0, ksplit])
 
     def small_linear_layer(self, input: DTensor, weight: DTensor,
                            output: DTensor, bias: DTensor = None,
@@ -2482,6 +2491,31 @@ class PersistentKernel:
         self.ext_layer("small_linear_sm100", inputs, [output], (g, 1, 1),
                        [batch, rows, k, output.dim(1),
                         0 if bias is None else 1, g])
+
+    @staticmethod
+    def gemm_ksplit(units: int, steps: int, tasks: int) -> int:
+        """Parts to split every unit's K steps into (moe_gemm's KS) for a
+        wave of `units` units of `steps` steps over `tasks` tasks. Only while
+        every part still has a task to itself -- a task's start costs more
+        than a few steps, so a second part on a task loses what the shorter
+        chain gains -- and when the chain gets shorter by more than the two
+        steps or so that handing the parts' sums over costs."""
+        best, best_cost = 1, float(steps)
+        for ks in range(2, steps // 2 + 1):
+            if units * ks > tasks:
+                break
+            cost = steps / ks + 2.0
+            if cost < best_cost - 1e-9:
+                best, best_cost = ks, cost
+        return best
+
+    @staticmethod
+    def gemm_scratch_size(units_max: int, ks: int, nt: int):
+        """(float32 elements of the parts' scratch, int32 elements of the
+        counters) a GEMM layer with ksplit = ks needs; (0, 0) at ks = 1."""
+        if ks <= 1:
+            return 0, 0
+        return units_max * ks * 128 * nt, units_max * 4
 
     @staticmethod
     def _bf16_step(k: int, batch: int, nt: int) -> int:
@@ -2521,6 +2555,8 @@ class PersistentKernel:
         residual: DTensor = None,
         tmem: DTensor = None,
         num_tasks: int = None,
+        ksplit: int = 1,
+        scratch: tuple = None,
     ):
         """output[:, :rows] = input @ W^T (+ bias) (+ residual), a linear
         layer on moe_gemm_layer's machinery: W packed by
@@ -2550,12 +2586,50 @@ class PersistentKernel:
             inputs.append(residual)
         if tmem is not None:
             inputs.append(tmem)
+        if ksplit > 1:
+            npass = (batch + nt - 1) // nt
+            need = self.gemm_scratch_size(npass * rb, ksplit, nt)
+            assert scratch is not None and scratch[0].dim(0) >= need[0] \
+                and scratch[1].dim(0) >= need[1], "gemm scratch too small"
+            inputs += [scratch[0], scratch[1]]
         self.ext_layer(
             "moe_gemm_sm100", inputs, [output], (g, 1, 1),
             [0, 0, 0 if bias is None else 1, 0, batch, 1, 1, nt, k, rows, kb,
              g, 0, 0, 0, 0,
              1, 0 if residual is None else 1, 1, 0 if tmem is None else 1,
-             output.dim(1)])
+             output.dim(1), ksplit])
+
+    def gemm_split_plans(self, layers: dict, nt: int, max_floats: int = 1 << 26):
+        """ksplit for a model's GEMM layers and one scratch for all of them
+        (they must run one after the other: layers that do not depend on each
+        other run at the same time and need a scratch each).
+
+        layers: name -> (expected units of the wave, steps of a unit, most
+        units the wave can have). Returns ({name: ksplit}, scratch) with
+        scratch = (float32 tensor, int32 tensor) attached, or None when no
+        layer splits. A layer whose scratch would pass max_floats stays
+        unsplit."""
+        ks, floats, ints = {}, 0, 0
+        for name, (units, steps, units_max) in layers.items():
+            k = self.gemm_ksplit(units, steps, self.num_workers)
+            need = self.gemm_scratch_size(units_max, k, nt)
+            if need[0] > max_floats:
+                k, need = 1, (0, 0)
+            ks[name] = k
+            floats, ints = max(floats, need[0]), max(ints, need[1])
+        if floats == 0:
+            return ks, None
+        part = torch.zeros(floats, dtype=torch.float32, device="cuda")
+        cnt = torch.zeros(ints, dtype=torch.int32, device="cuda")
+        return ks, (self.attach_input(torch_tensor=part, name="gemm_parts"),
+                    self.attach_input(torch_tensor=cnt, name="gemm_part_counts"))
+
+    def gemm_steps(self, k: int, batch: int, mxfp4_kb: int = None) -> int:
+        """K steps of a GEMM unit (for gemm_ksplit)."""
+        from .moe_pack import moe_tokens_per_pass
+        if mxfp4_kb:
+            return k // mxfp4_kb
+        return k // self._bf16_step(k, batch, moe_tokens_per_pass(batch))
 
     def moe_combine_layer(
         self,
