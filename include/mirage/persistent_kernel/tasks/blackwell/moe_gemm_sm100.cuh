@@ -508,10 +508,25 @@ __device__ __forceinline__ void
   // (An MMA costs the issuing thread 35 .. 45 ns whatever its N. Spreading
   // a unit's MMAs over NACC independent accumulators that the epilogue adds
   // up was tried, 4 at NT 16: no gain, so it is not a dependency chain.)
+  // Two threads issuing at once do get more out of the SM while N is small
+  // (measured on a B200, M = 128: one thread 32 ns an MMA at N = 16 .. 64,
+  // two threads 21 ns of the SM at N = 16 and 26 at N = 64, four no better;
+  // at N = 128 the MMA itself takes 35 ns and at N = 256 twice that, so
+  // neither more threads nor weight rows on the N side help there). MMA2: a
+  // second thread (warp 7) issues every other MMA, into an accumulator of
+  // its own, and the gather makes do with warp 6. Not at NT 64 with MXFP4,
+  // where the second accumulators would cost two of the four A stages.
+#ifdef MXG_MMA2
+  constexpr bool MMA2 = MXG_MMA2;
+#else
+  constexpr bool MMA2 = NT <= 32 || (!MX && NT <= 64);
+#endif
+  constexpr int NMT = MMA2 ? 2 : 1;  // threads that issue MMAs
+  constexpr int GL = MMA2 ? 32 : 64; // lanes of the gather
 #ifdef MXG_NACC
   constexpr int NACC = MXG_NACC;
 #else
-  constexpr int NACC = 1;
+  constexpr int NACC = NMT;
 #endif
   constexpr int ACC_COLS = NACC * NT; // TMEM columns of an accumulator stage
   // rows of a B box: the most tokens a pass can have
@@ -679,21 +694,21 @@ __device__ __forceinline__ void
 #pragma unroll 1
     for (int i = 0; i < STG; ++i) {
       mbar_init(&x_full[i], 1);
-      mbar_init(&x_empty[i], MX ? 4 : 1);
+      mbar_init(&x_empty[i], MX ? 4 : NMT);
     }
 #pragma unroll 1
     for (int i = 0; i < SA; ++i) {
       mbar_init(&a_ready[i], 4);
-      mbar_init(&a_empty[i], 1);
+      mbar_init(&a_empty[i], NMT);
     }
 #pragma unroll 1
     for (int i = 0; i < STGB; ++i) {
-      mbar_init(&b_full[i], 64);
-      mbar_init(&b_empty[i], 1);
+      mbar_init(&b_full[i], GL);
+      mbar_init(&b_empty[i], NMT);
     }
 #pragma unroll 1
     for (int i = 0; i < AS; ++i) {
-      mbar_init(&acc_full[i], 1);
+      mbar_init(&acc_full[i], NMT);
       mbar_init(&acc_empty[i], 4);
     }
     asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
@@ -1005,9 +1020,10 @@ __device__ __forceinline__ void
         }
       }
     }
-  } else if (warp == 5) {
-    // ---- the MMAs
+  } else if (warp == 5 || (MMA2 && warp == 7)) {
+    // ---- the MMAs (MMA2: this thread's half of them)
     if (lane == 0) {
+      const int half = warp == 7 ? 1 : 0;
       int gs = 0;
 #pragma unroll 1
       for (int j = 0; j < n_my; ++j) {
@@ -1050,10 +1066,15 @@ __device__ __forceinline__ void
           for (int b = 0; b < TPB; ++b) {
             const u64 bd = smem_desc(sm_u32(breg + bs * BSTG + b * BBOX));
 #pragma unroll
-            for (int kk = 0; kk < 4; ++kk, ++mi) {
+            for (int k2 = 0; k2 < 4 / NMT; ++k2, ++mi) {
               static_assert((TPB * 4) % NACC == 0, "accumulator of an MMA");
-              const int accf = (kb > 0 || b * 4 + kk >= NACC) ? 1 : 0;
-              const unsigned tdm = td + ((b * 4 + kk) % NACC) * NT;
+              static_assert(!MMA2 || NACC == 2, "an accumulator a thread");
+              const int kk = MMA2 ? 2 * k2 + half : k2;
+              const int accf =
+                  MMA2 ? ((kb > 0 || b > 0 || k2 > 0) ? 1 : 0)
+                       : ((kb > 0 || b * 4 + kk >= NACC) ? 1 : 0);
+              const unsigned tdm =
+                  td + (MMA2 ? half : (b * 4 + kk) % NACC) * NT;
 #ifdef MXG_ABL_NO_MMA
               if (mi > 0) {
                 continue;
@@ -1109,11 +1130,12 @@ __device__ __forceinline__ void
       }
     }
   } else {
-    // ---- the activation gather: 64 lanes, a lane copies one 16 B chunk of
-    // every 8th token in every box (row r of a box, chunk c: SWIZZLE_128B
-    // puts it at chunk c ^ (r & 7))
-    const int gl = (warp - 6) * 32 + lane;
-    const int tsub = gl >> 3, c = gl & 7;
+    // ---- the activation gather: GL lanes, a lane copies 64 / GL of the
+    // eight 16 B chunks of every 8th token in every box (row r of a box,
+    // chunk c: SWIZZLE_128B puts it at chunk c ^ (r & 7))
+    constexpr int CPL = 64 / GL;
+    const int gl = MMA2 ? lane : (warp - 6) * 32 + lane;
+    const int tsub = gl / (8 / CPL), c0 = (gl % (8 / CPL)) * CPL;
     int gs = 0;
 #pragma unroll 1
     for (int j = 0; j < n_my; ++j) {
@@ -1131,7 +1153,7 @@ __device__ __forceinline__ void
           const size_t r = IN_SLOTTED ? static_cast<size_t>(ent >> 8) * SLOTS +
                                             (ent & 0xff)
                                       : static_cast<size_t>(ent >> 8);
-          src[it] = x + r * (K * 2) + c * 16;
+          src[it] = x + r * (K * 2);
         }
       }
       if (B2X && j >= 2) {
@@ -1151,8 +1173,12 @@ __device__ __forceinline__ void
           if (jt < n) {
 #pragma unroll
             for (int b = 0; b < TPB; ++b) {
-              cp_async16(bst + b * BBOX + jt * 128 + ((c ^ (jt & 7)) << 4),
-                         src[it] + (kb * KB + b * 64) * 2);
+#pragma unroll
+              for (int cc = 0; cc < CPL; ++cc) {
+                const int c = c0 + cc;
+                cp_async16(bst + b * BBOX + jt * 128 + ((c ^ (jt & 7)) << 4),
+                           src[it] + c * 16 + (kb * KB + b * 64) * 2);
+              }
             }
           }
         }
