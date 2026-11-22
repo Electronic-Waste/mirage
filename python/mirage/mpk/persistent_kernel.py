@@ -2598,9 +2598,11 @@ class PersistentKernel:
                      eps: float = 1e-6, num_tasks: int = None):
         """RMSNorm with the weight 1 + w, [batch, H] bf16 (fp32 inside)."""
         batch, h = input.dim(0), input.dim(1)
-        g = self._token_tasks(batch, num_tasks)
+        # (a whole block a token while every token can have a worker)
+        wide = batch <= self.num_workers and h % 2048 == 0 and num_tasks is None
+        g = batch if wide else self._token_tasks(batch, num_tasks)
         self.ext_layer("norm1p_sm100", [input, weight], [output], (g, 1, 1),
-                       [batch, h, g, self._float_bits(eps)])
+                       [batch, h, g, self._float_bits(eps), 1 if wide else 0])
 
     def qsa_prep_layer(self, proj: DTensor, q_norm: DTensor, k_norm: DTensor,
                        output: DTensor, num_kv_heads: int, q_per_kv: int,

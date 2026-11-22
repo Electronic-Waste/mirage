@@ -680,39 +680,6 @@ __device__ __forceinline__ void
     ut[tid * 4 + 2] = u % RB;
     ut[tid * 4 + 3] = left < NT ? left : NT;
   }
-  if (tid == 0) {
-    // The window holds the last GEMM task's barriers, and the SM its states
-    // of them: the first mbarrier.init of a task (a store, then an
-    // invalidation of the SM's barrier states) lost to those, so that the
-    // barriers initialised first kept the old task's phase -- an odd one let
-    // the weight copies run a stage ahead of the MMAs (wrong weights, or an
-    // arrive on a copy still in flight: an illegal instruction). A barrier
-    // nothing uses goes first and takes that; what follows is initialised on
-    // a clean slate.
-    mbar_init(bar_flush, 1);
-    asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
-#pragma unroll 1
-    for (int i = 0; i < STG; ++i) {
-      mbar_init(&x_full[i], 1);
-      mbar_init(&x_empty[i], MX ? 4 : NMT);
-    }
-#pragma unroll 1
-    for (int i = 0; i < SA; ++i) {
-      mbar_init(&a_ready[i], 4);
-      mbar_init(&a_empty[i], NMT);
-    }
-#pragma unroll 1
-    for (int i = 0; i < STGB; ++i) {
-      mbar_init(&b_full[i], GL);
-      mbar_init(&b_empty[i], NMT);
-    }
-#pragma unroll 1
-    for (int i = 0; i < AS; ++i) {
-      mbar_init(&acc_full[i], NMT);
-      mbar_init(&acc_empty[i], 4);
-    }
-    asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
-  }
   // HELD: the worker's TMEM stays allocated from its first GEMM task of the
   // iteration (which records the address, top bit set, in the token tensor)
   // to the release wave.
@@ -721,11 +688,37 @@ __device__ __forceinline__ void
                  task_desc->input_ptrs[IDX_RES + RES + MXG_TRACE_INPUTS]) +
                  blockIdx.x
            : nullptr;
-  if (HELD) {
-    if (tid == 0) {
-      misc[2] = *held_tok;
-    }
-    __syncthreads();
+  // The window holds the last GEMM task's barriers, and the SM its states of
+  // them: the first mbarrier.init of a task (a store, then an invalidation
+  // of the SM's barrier states) lost to those, so that the barriers
+  // initialised first kept the old task's phase -- an odd one let the weight
+  // copies run a stage ahead of the MMAs (wrong weights, or an arrive on a
+  // copy still in flight: an illegal instruction). So every warp first
+  // initialises a barrier of its own that nothing uses, which takes that;
+  // then the barriers proper, a thread each (one thread doing all of them
+  // took 2 us of every task: up to 88 stores, half as many invalidations).
+  if (lane == 0) {
+    mbar_init(&bar_flush[warp], 1);
+    asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
+  }
+  if (HELD && tid == 0) {
+    misc[2] = *held_tok;
+  }
+  __syncthreads();
+  static_assert(NBAR <= 224, "a barrier a thread of warps 0 .. 6");
+  if (tid < NBAR) {
+    const int i = tid;
+    const int count =
+        i < STG ? 1
+        : i < 2 * STG ? (MX ? 4 : NMT)
+        : i < 2 * STG + SA ? 4
+        : i < 2 * STG + 2 * SA ? NMT
+        : i < 2 * STG + 2 * SA + STGB ? GL
+        : i < 2 * STG + 2 * SA + 2 * STGB ? NMT
+        : i < 2 * STG + 2 * SA + 2 * STGB + AS ? NMT
+        : 4;
+    mbar_init(&x_full[i], count);
+    asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
   }
   const bool have_tmem = HELD && misc[2] < 0;
   if (!have_tmem && warp == 0) {
@@ -734,22 +727,17 @@ __device__ __forceinline__ void
   }
   __syncthreads();
   tmem_fence_after();
-  if (have_tmem) {
-    if (tid == 0) {
-      misc[1] = misc[2] & 0x7fffffff;
-    }
-  } else if (HELD && tid == 0) {
+  if (!have_tmem && HELD && tid == 0) {
     *held_tok = misc[1] | static_cast<int>(0x80000000u);
-  }
-  if (HELD) {
-    __syncthreads();
   }
 #ifdef MXG_TRACE
   if (tid == 0) {
     MXG_T(2);
   }
 #endif
-  const unsigned tb = static_cast<unsigned>(misc[1]); // accumulators
+  // the accumulators
+  const unsigned tb = static_cast<unsigned>(
+      have_tmem ? (misc[2] & 0x7fffffff) : misc[1]);
   // unit j of this task: expert, pass, row block, tokens
   auto unit_at = [&](int j, int &e, int &p, int &rb, int &n) {
     if (DENSE) {
