@@ -46,6 +46,10 @@ if __name__ == "__main__":
     parser.add_argument("--max-num-pages", default=None, type=int,
                         help="Max num pages. Exclusive with --kv-budget")
     parser.add_argument("--output-dir", help="Output files directory")
+    parser.add_argument("--dense", choices=["mpk", "gemm"], default="mpk",
+                        help="the linear layers other than the experts': "
+                             "MPK's (mpk) or the expert GEMM task's dense "
+                             "mode (gemm, kept for comparison)")
     parser.add_argument("--ignore-eos", action="store_true",
                         help="Ignore eos token during generation")
     args = parser.parse_args()
@@ -123,8 +127,9 @@ if __name__ == "__main__":
         num_workers, num_schedulers = mi.get_configurations_from_gpu(0)
         # The task graph is queued once an iteration, so the schedulers have
         # little to do: on a 148-SM GPU 144 workers and 16 schedulers (4
-        # CTAs) instead of 128 and 64 (GPT-OSS at batch 16: 865 -> 633 ms;
-        # with 4 schedulers the queueing itself slows batch 1 down).
+        # CTAs) instead of 128 and 64. Worth little: GPT-OSS at batch
+        # 1 / 4 / 16 363 / 530 / 791 -> 375 / 515 / 739 ms, Qwen3.5 the same
+        # either way (with 4 schedulers the queueing slows batch 1 down).
         if torch.cuda.get_device_properties(0).multi_processor_count >= 148:
             num_workers, num_schedulers = 144, 16
         # Benchmark hook: MPK_BENCH_WORKERS="<workers>,<schedulers>" overrides
@@ -156,7 +161,8 @@ if __name__ == "__main__":
         )
 
         print("Building the task graph...")
-        q35_builder = Qwen35Builder(mpk, kv_plan=kv_plan, num_requests=n_req)
+        q35_builder = Qwen35Builder(mpk, kv_plan=kv_plan, num_requests=n_req,
+                                    dense=args.dense)
         q35_builder.build_from_model(model_name=args.model,
                                      model_path=args.model)
         print("Compiling the megakernel...")

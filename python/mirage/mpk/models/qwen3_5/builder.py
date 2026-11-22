@@ -54,8 +54,13 @@ class Qwen35Builder(GraphBuilder):
 
     def __init__(self, mpk: PersistentKernel, weights: Optional[dict] = None,
                  kv_plan: Optional[KVCachePlan] = None,
-                 num_requests: Optional[int] = None):
+                 num_requests: Optional[int] = None, dense: str = "mpk"):
+        """dense: the linear layers other than the experts' (the mixers'
+        projections, the router, lm_head) -- "mpk": MPK's linear layers;
+        "gemm": the expert GEMM task's dense mode, kept for comparison."""
         super().__init__(mpk, weights)
+        assert dense in ("mpk", "gemm")
+        self.dense_gemm = dense == "gemm"
         assert mpk.world_size == 1, "Qwen3.5 is single-GPU for now"
         assert mpk.max_tokens_per_request == 1, (
             "Qwen3.5 needs one token a request and step: set "
@@ -138,10 +143,18 @@ class Qwen35Builder(GraphBuilder):
         self._keep.append(tensor)
         return self.mpk.attach_input(torch_tensor=tensor, name=name)
 
-    def _dense(self, weight: torch.Tensor, name: str):
-        """A linear layer's weight [rows, K] as dense_gemm_layer's tiles."""
-        return self._attach(
-            moe_pack.pack_bf16_tiles(weight.to("cuda")[None]), name)
+    def _dense(self, weight: torch.Tensor, name: str, rows: int = None):
+        """A linear layer's weight [rows, K]: as it is for MPK's linear layer
+        (zero rows up to `rows`, a multiple of its 128-row tasks), or as
+        dense_gemm_layer's tiles."""
+        if self.dense_gemm:
+            return self._attach(
+                moe_pack.pack_bf16_tiles(weight.to("cuda")[None]), name)
+        if rows is not None and weight.shape[0] != rows:
+            weight = torch.cat(
+                [weight, weight.new_zeros(rows - weight.shape[0],
+                                          weight.shape[1])], dim=0)
+        return self._attach(weight, name)
 
     def _gdn_weights(self, sd, p, i):
         """in_proj_qkv, in_proj_z, in_proj_b, in_proj_a as one projection
@@ -162,7 +175,7 @@ class Qwen35Builder(GraphBuilder):
         if getattr(self, "debug", None) is not None:
             self.debug[f"gdn_state_{i}"] = state
             self.debug[f"conv_state_{i}"] = conv_state
-        return (self._dense(w, f"layer_{i}_gdn_proj"),
+        return (self._dense(w, f"layer_{i}_gdn_proj", self.gdn_pw),
                 self._attach(sd[la + "conv1d.weight"].reshape(channels, 4),
                              f"layer_{i}_gdn_conv"),
                 self._attach(conv_state, f"layer_{i}_gdn_conv_state"),
@@ -186,7 +199,8 @@ class Qwen35Builder(GraphBuilder):
             rows.append(k[g])
             rows.append(v[g])
         rows.append(q[:, 1].reshape(-1, h))
-        return (self._dense(torch.cat(rows, dim=0), f"layer_{i}_attn_proj"),
+        return (self._dense(torch.cat(rows, dim=0), f"layer_{i}_attn_proj",
+                            self.attn_pw),
                 self._attach(sd[sa + "q_norm.weight"], f"layer_{i}_q_norm"),
                 self._attach(sd[sa + "k_norm.weight"], f"layer_{i}_k_norm"),
                 self._dense(sd[sa + "o_proj.weight"], f"layer_{i}_o_proj"))
@@ -208,9 +222,11 @@ class Qwen35Builder(GraphBuilder):
                        dim=0).to("cuda")
         w13 = moe_pack.pack_bf16_tiles(moe_pack.interleave_gate_up(w13))
         w2 = moe_pack.pack_bf16_tiles(w2)
-        small = self.mpk.max_num_batched_tokens * router.shape[0] <= 8192
-        return ((self._attach if small else self._dense)(
-                    router, f"layer_{i}_router"),
+        small = self.dense_gemm and \
+            self.mpk.max_num_batched_tokens * router.shape[0] <= 8192
+        return ((self._attach(router, f"layer_{i}_router") if small
+                 else self._dense(router, f"layer_{i}_router",
+                                  self.router_rows)),
                 self._attach(w13, f"layer_{i}_w13"),
                 self._attach(w2, f"layer_{i}_w2"))
 
@@ -225,9 +241,12 @@ class Qwen35Builder(GraphBuilder):
         e_tot = self.num_experts + 1
         self.qkv_size = self.num_kv_heads * (self.q_per_kv + 2) * hd
         self.attn_size = self.num_q_heads * hd
-        self.attn_pw = self.qkv_size + self.attn_size
-        self.gdn_pw = 4 * self.gdn_key_heads * gd + nvh * gd + 2 * nvh
-        self.router_rows = _round_up(e_tot, 8)
+        # (MPK's linear layer: 128 output rows a task)
+        pad = 1 if self.dense_gemm else 128
+        self.attn_pw = _round_up(self.qkv_size + self.attn_size, pad)
+        self.gdn_pw = _round_up(
+            4 * self.gdn_key_heads * gd + nvh * gd + 2 * nvh, pad)
+        self.router_rows = _round_up(e_tot, 8 if self.dense_gemm else 128)
         self.moe_nt = moe_pack.moe_tokens_per_pass(mbt)
         cap = moe_pack.moe_plan_cap(mbt, e_tot, slots, self.moe_nt)
 
@@ -291,27 +310,53 @@ class Qwen35Builder(GraphBuilder):
                                                 dtype=torch.int32, device="cuda")
             self.gdn_debug = mpk.attach_input(
                 torch_tensor=self.gdn_debug_tensor, name="gdn_debug")
-        # every GEMM is a moe_gemm task: the workers keep their TMEM across
-        # them (tmem_release_layer at the end)
-        tmem = self._attach(torch.zeros(mpk.num_workers, dtype=torch.int32),
-                            "tmem_token")
+        # dense="gemm": every GEMM is a moe_gemm task and the workers keep
+        # their TMEM across them (tmem_release_layer at the end). Not with
+        # MPK's linear layers, which allocate TMEM themselves.
+        tmem = None
+        if self.dense_gemm:
+            tmem = self._attach(
+                torch.zeros(mpk.num_workers, dtype=torch.int32), "tmem_token")
         # at small batches a wave has fewer units than workers: split every
         # unit's K steps (moe_gemm's KS) so that all of them work
         nt = self.moe_nt
         npass = (mbt + nt - 1) // nt
         active = min(e_tot, mbt * slots)
         rb = lambda rows: (rows + 127) // 128
-        ks, scratch = mpk.gemm_split_plans({
-            "gdn_proj": (npass * rb(self.gdn_pw), mpk.gemm_steps(h, mbt),
-                         npass * rb(self.gdn_pw)),
-            "attn_proj": (npass * rb(self.attn_pw), mpk.gemm_steps(h, mbt),
-                          npass * rb(self.attn_pw)),
-            "out": (npass * rb(h), mpk.gemm_steps(nvh * gd, mbt), npass * rb(h)),
+        layers = {
             "w13": (active * rb(2 * self.moe_inter), mpk.gemm_steps(h, mbt),
                     cap * rb(2 * self.moe_inter)),
             "w2": (active * rb(h), mpk.gemm_steps(self.moe_inter, mbt),
                    cap * rb(h)),
-        }, nt)
+        }
+        if self.dense_gemm:
+            layers.update({
+                "gdn_proj": (npass * rb(self.gdn_pw), mpk.gemm_steps(h, mbt),
+                             npass * rb(self.gdn_pw)),
+                "attn_proj": (npass * rb(self.attn_pw), mpk.gemm_steps(h, mbt),
+                              npass * rb(self.attn_pw)),
+                "out": (npass * rb(h), mpk.gemm_steps(nvh * gd, mbt),
+                        npass * rb(h)),
+            })
+        ks, scratch = mpk.gemm_split_plans(layers, nt)
+
+        def linear(input, weight, output, rows, name, residual=None):
+            """A dense linear layer: MPK's (128 output rows a task; 64 with a
+            residual), or the expert GEMM task's dense mode."""
+            if self.dense_gemm:
+                mpk.dense_gemm_layer(
+                    input=input, weight=weight, output=output, rows=rows,
+                    residual=residual, tmem=tmem, ksplit=ks.get(name, 1),
+                    scratch=scratch if ks.get(name, 1) > 1 else None)
+            elif residual is not None:
+                mpk.linear_with_residual_layer(
+                    input=input, weight=weight, residual=residual,
+                    output=output, grid_dim=(rows // 64, 1, 1),
+                    block_dim=(256, 1, 1))
+            else:
+                mpk.linear_layer(
+                    input=input, weight=weight, output=output,
+                    grid_dim=(rows // 128, 1, 1), block_dim=(256, 1, 1))
 
         mpk.embed_layer(
             input=x, weight=self._attach(sd["embed_tokens.weight"], "embed_tokens"),
@@ -328,20 +373,14 @@ class Qwen35Builder(GraphBuilder):
             if self.layer_types[i] == "linear_attention":
                 w_proj, conv_w, conv_state, state, par, w_out = \
                     self._gdn_weights(sd, p, i)
-                mpk.dense_gemm_layer(input=normed, weight=w_proj,
-                                     output=gdn_proj, rows=self.gdn_pw,
-                                     tmem=tmem, ksplit=ks["gdn_proj"],
-                                     scratch=scratch)
+                linear(normed, w_proj, gdn_proj, self.gdn_pw, "gdn_proj")
                 mpk.gdn_step_layer(gdn_proj, conv_w, conv_state, state, par,
                                    gdn_out, self.gdn_key_heads, gd, eps=self.eps,
                                    after=self.gdn_debug)
                 mixed, w_o = gdn_out, w_out
             else:
                 w_proj, wq, wk, w_o = self._attn_weights(sd, p, i)
-                mpk.dense_gemm_layer(input=normed, weight=w_proj,
-                                     output=attn_proj, rows=self.attn_pw,
-                                     tmem=tmem, ksplit=ks["attn_proj"],
-                                     scratch=scratch)
+                linear(normed, w_proj, attn_proj, self.attn_pw, "attn_proj")
                 mpk.qsa_prep_layer(attn_proj, wq, wk, attn_in,
                                    self.num_kv_heads, self.q_per_kv, hd,
                                    eps=self.eps)
@@ -368,9 +407,7 @@ class Qwen35Builder(GraphBuilder):
                     rotary_dim=self.rotary_dim, group_id=group_id)
                 mpk.gate_mul_layer(attn_out, attn_proj, self.qkv_size, attn_gated)
                 mixed = attn_gated
-            mpk.dense_gemm_layer(input=mixed, weight=w_o, residual=x,
-                                 output=mixer_out, rows=h, tmem=tmem,
-                                 ksplit=ks["out"], scratch=scratch)
+            linear(mixed, w_o, mixer_out, h, "out", residual=x)
             x = mixer_out
 
             w_router, w13, w2 = self._moe_weights(sd, p, i)
@@ -378,12 +415,14 @@ class Qwen35Builder(GraphBuilder):
                 x, self._attach(sd[p + "post_attention_layernorm.weight"],
                                 f"layer_{i}_post_norm"),
                 normed, eps=self.eps)
-            if mbt * e_tot <= 8192:
+            if self.dense_gemm and mbt * e_tot <= 8192:
                 mpk.small_linear_layer(input=normed, weight=w_router,
                                        output=logits)
-            else:
+            elif self.dense_gemm:
                 mpk.dense_gemm_layer(input=normed, weight=w_router,
                                      output=logits, rows=e_tot, tmem=tmem)
+            else:
+                linear(normed, w_router, logits, self.router_rows, "router")
             mpk.moe_route_layer(logits=logits, weight=weight,
                                 route_list=route_list, route_meta=route_meta,
                                 nt=self.moe_nt, num_experts=self.num_experts,
@@ -404,13 +443,22 @@ class Qwen35Builder(GraphBuilder):
 
         mpk.norm1p_layer(x, self._attach(sd["norm.weight"], "model_norm"),
                          final_normed, eps=self.eps)
-        mpk.dense_gemm_layer(
-            input=final_normed, weight=self._dense(sd["lm_head.weight"], "lm_head"),
-            output=argmax_in, rows=self.vocab_size, tmem=tmem)
-        mpk.tmem_release_layer(
-            argmax_in, tmem,
-            self._attach(torch.zeros(mpk.num_workers, dtype=torch.int32),
-                         "tmem_done"))
+        if self.dense_gemm:
+            mpk.dense_gemm_layer(
+                input=final_normed,
+                weight=self._dense(sd["lm_head.weight"], "lm_head"),
+                output=argmax_in, rows=self.vocab_size, tmem=tmem)
+            mpk.tmem_release_layer(
+                argmax_in, tmem,
+                self._attach(torch.zeros(mpk.num_workers, dtype=torch.int32),
+                             "tmem_done"))
+        else:
+            mpk.linear_layer(
+                input=final_normed,
+                weight=self._dense(sd["lm_head.weight"], "lm_head"),
+                output=argmax_in,
+                grid_dim=(grid_for_rmsnorm_linear_layer(self.vocab_size), 1, 1),
+                block_dim=(256, 1, 1))
         mpk.argmax_partial_layer(
             input=argmax_in, output=(argmax_part_value, argmax_part_index),
             grid_dim=(argmax_tasks, 1, 1), block_dim=(256, 1, 1))

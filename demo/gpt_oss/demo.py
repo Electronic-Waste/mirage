@@ -55,6 +55,10 @@ if __name__ == "__main__":
                         help="plan: route plan + packed expert GEMMs (the "
                              "released MXFP4 checkpoint or a bf16 one); "
                              "legacy: the bf16-only MoE linear layers")
+    parser.add_argument("--dense", choices=["mpk", "gemm"], default="mpk",
+                        help="the other linear layers: MPK's (mpk) or the "
+                             "expert GEMM task's dense mode (gemm, with "
+                             "--moe plan; kept for comparison)")
     args = parser.parse_args()
 
     print("Input arguments:", args)
@@ -130,8 +134,9 @@ if __name__ == "__main__":
         num_workers, num_schedulers = mi.get_configurations_from_gpu(0)
         # The task graph is queued once an iteration, so the schedulers have
         # little to do: on a 148-SM GPU 144 workers and 16 schedulers (4
-        # CTAs) instead of 128 and 64 (GPT-OSS at batch 16: 865 -> 633 ms;
-        # with 4 schedulers the queueing itself slows batch 1 down).
+        # CTAs) instead of 128 and 64. Worth little: GPT-OSS at batch
+        # 1 / 4 / 16 363 / 530 / 791 -> 375 / 515 / 739 ms, Qwen3.5 the same
+        # either way (with 4 schedulers the queueing slows batch 1 down).
         if torch.cuda.get_device_properties(0).multi_processor_count >= 148:
             num_workers, num_schedulers = 144, 16
         # Benchmark hook: MPK_BENCH_WORKERS="<workers>,<schedulers>" overrides
@@ -163,7 +168,8 @@ if __name__ == "__main__":
         )
 
         print("Building the task graph...")
-        GptOssBuilder(mpk, kv_plan=kv_plan, moe=args.moe).build_from_model(
+        GptOssBuilder(mpk, kv_plan=kv_plan, moe=args.moe,
+                      dense=args.dense).build_from_model(
             model_name=args.model, model_path=args.model)
         print("Compiling the megakernel...")
         mpk.compile(output_dir=args.output_dir)

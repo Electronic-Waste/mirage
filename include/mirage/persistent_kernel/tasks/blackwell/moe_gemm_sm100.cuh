@@ -720,16 +720,6 @@ __device__ __forceinline__ void
     mxg_tr[6] = task_i;
   }
 #endif
-  if (!DENSE && tid < n_my) {
-    const int u = (task_i + tid * G) / KS;
-    const int ent = meta[1 + u / RB];
-    const int e = ent >> 16, p = ent & 0xffff;
-    const int left = meta[1 + CAP + e] - p * NT;
-    ut[tid * 4 + 0] = e;
-    ut[tid * 4 + 1] = p;
-    ut[tid * 4 + 2] = u % RB;
-    ut[tid * 4 + 3] = left < NT ? left : NT;
-  }
   // HELD: the worker's TMEM stays allocated from its first GEMM task of the
   // iteration (which records the address, top bit set, in the token tensor)
   // to the release wave.
@@ -747,14 +737,26 @@ __device__ __forceinline__ void
   // initialises a barrier of its own that nothing uses, which takes that;
   // then the barriers proper, a thread each (one thread doing all of them
   // took 2 us of every task: up to 88 stores, half as many invalidations).
+  // Nothing of this task is in shared memory before that.
   if (lane == 0) {
     mbar_init(&bar_flush[warp], 1);
     asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
   }
-  if (HELD && tid == 0) {
-    misc[2] = *held_tok;
-  }
   __syncthreads();
+  // (Only now this task's own data: that first initialisation is also when
+  // the SM writes back what it holds of the last task's barriers, wherever
+  // that task had them -- MPK's linear layers have theirs where the unit
+  // table below is.)
+  if (!DENSE && tid < n_my) {
+    const int u = (task_i + tid * G) / KS;
+    const int ent = meta[1 + u / RB];
+    const int e = ent >> 16, p = ent & 0xffff;
+    const int left = meta[1 + CAP + e] - p * NT;
+    ut[tid * 4 + 0] = e;
+    ut[tid * 4 + 1] = p;
+    ut[tid * 4 + 2] = u % RB;
+    ut[tid * 4 + 3] = left < NT ? left : NT;
+  }
   static_assert(NBAR <= 224, "a barrier a thread of warps 0 .. 6");
   if (tid < NBAR) {
     const int i = tid;
@@ -770,7 +772,8 @@ __device__ __forceinline__ void
     mbar_init(&x_full[i], count);
     asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
   }
-  const bool have_tmem = HELD && misc[2] < 0;
+  const int held = HELD ? *held_tok : 0; // (every thread reads it itself)
+  const bool have_tmem = held < 0;
   if (!have_tmem && warp == 0) {
     tmem_alloc512(reinterpret_cast<unsigned *>(&misc[1]));
     tmem_fence_before();
@@ -787,7 +790,7 @@ __device__ __forceinline__ void
 #endif
   // the accumulators
   const unsigned tb = static_cast<unsigned>(
-      have_tmem ? (misc[2] & 0x7fffffff) : misc[1]);
+      have_tmem ? (held & 0x7fffffff) : misc[1]);
   // unit j of this task: expert, pass, row block, tokens
   auto unit_at = [&](int j, int &e, int &p, int &rb, int &n) {
     if (DENSE) {
