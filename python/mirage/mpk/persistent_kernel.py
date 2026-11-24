@@ -337,6 +337,7 @@ def get_compile_command(
 
     flags = flags + [f"-DMPK_MAX_NUM_BATCHED_TOKENS={mpk.max_num_batched_tokens}"]
     flags = flags + [f"-DMPK_MAX_TOKENS_PER_REQUEST={mpk.max_tokens_per_request}"]
+    flags = flags + [f"-DMPK_LINEAR_MMA_N={mpk.linear_mma_n}"]
     flags = flags + [f"-DMPK_MAX_NUM_PAGES={mpk.max_num_pages}"]
     flags = flags + [f"-DMPK_NUM_KV_GROUPS={len(mpk.kv_groups)}"]
     if "kv_event_log" in mpk.meta_tensors:
@@ -452,6 +453,7 @@ class PersistentKernel:
         kv_groups: list = None,
         page_size: int = None,
         max_tokens_per_request: Optional[int] = None,
+        linear_mma_n: Optional[int] = None,
     ):
         self.__finalized__ = False
         self._is_compiled = False
@@ -509,6 +511,18 @@ class PersistentKernel:
             f"max_tokens_per_request={max_tokens_per_request} must be in "
             f"[1, max_num_batched_tokens={max_num_batched_tokens}]")
         self.max_tokens_per_request = max_tokens_per_request
+        # Tokens per tile of the SM100 linear tasks (see MPK_LINEAR_MMA_N in
+        # runtime_header.h). A task re-reads its weights for every tile of
+        # the batch, so a kernel built for a batch above 16 may want wider
+        # tiles. Each output element stays the same chain of MMAs, so the
+        # results do not change (a split-K layer still adds its bf16 partial
+        # sums in the order its tasks finish). Unset = MPK_LINEAR_MMA_N env
+        # var, else 16.
+        if linear_mma_n is None:
+            linear_mma_n = int(os.environ.get("MPK_LINEAR_MMA_N") or 16)
+        assert linear_mma_n in (16, 32, 64, 128), (
+            f"linear_mma_n={linear_mma_n} must be 16, 32, 64 or 128")
+        self.linear_mma_n = linear_mma_n
         self.eos_token_id = eos_token_id
         self.kn_graph = KNGraph(CyKNGraph(disable_fingerprint=True))
         # Prevent GC of PyTorch tensors whose GPU pointers are baked into the
@@ -708,6 +722,7 @@ class PersistentKernel:
             "max_num_batched_requests": self.max_num_batched_requests,
             "max_num_batched_tokens": self.max_num_batched_tokens,
             "max_tokens_per_request": self.max_tokens_per_request,
+            "linear_mma_n": self.linear_mma_n,
             "max_num_pages": self.max_num_pages,
             "page_size": self.page_size,
             "world_size": self.world_size,
@@ -730,6 +745,7 @@ class PersistentKernel:
             ("max_num_batched_requests", self.max_num_batched_requests),
             ("max_num_batched_tokens", self.max_num_batched_tokens),
             ("max_tokens_per_request", self.max_tokens_per_request),
+            ("linear_mma_n", self.linear_mma_n),
             ("max_num_pages", self.max_num_pages),
             ("page_size", self.page_size),
             ("world_size", self.world_size),

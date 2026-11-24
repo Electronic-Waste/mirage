@@ -35,6 +35,30 @@ constexpr int WORKER_RESERVED_STATIC_SHARED_MEMORY_SIZE = 6 * 1024;
 constexpr int WORKER_RESERVED_STATIC_SHARED_MEMORY_SIZE = 3 * 1024;
 #endif
 
+// Tokens that one tile of the SM100 linear tasks (linear, with residual or
+// bias, split-K) covers: the N of its tcgen05 MMA. A task streams its weights
+// once per tile, so a batch above 16 re-reads them ceil(batch / N) times;
+// a build for such a batch may raise N (PersistentKernel(linear_mma_n=...)).
+// The stage counts are what fits the task's shared memory with that N:
+// 16 KB of weights + N * 128 B of activations per A/B stage, N * 256 B per
+// output stage.
+#ifndef MPK_LINEAR_MMA_N
+#define MPK_LINEAR_MMA_N 16
+#endif
+#if MPK_LINEAR_MMA_N <= 32
+#define MPK_LINEAR_AB_STAGES 8
+#define MPK_LINEAR_C_STAGES 4
+#elif MPK_LINEAR_MMA_N <= 64
+#define MPK_LINEAR_AB_STAGES 6
+#define MPK_LINEAR_C_STAGES 2
+#else
+#define MPK_LINEAR_AB_STAGES 4
+#define MPK_LINEAR_C_STAGES 2
+#endif
+static_assert(MPK_LINEAR_MMA_N % 16 == 0 && MPK_LINEAR_MMA_N >= 16 &&
+                  MPK_LINEAR_MMA_N <= 128,
+              "MPK_LINEAR_MMA_N: a multiple of 16 up to 128");
+
 #if defined(MODE_ONLINE_NOTOKEN) || defined(MODE_MULTI_TURN)
 // Have to be smaller for vllm compatibility, or program will stuck
 #if MPK_TARGET_CC >= 90

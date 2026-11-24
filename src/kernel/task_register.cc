@@ -2071,15 +2071,12 @@ int TaskRegister::register_linear_sm100_task(threadblock::Graph const &bgraph,
   code.inc_indent();
   // define MMA
   constexpr int MMA_M = 128;
-  constexpr int MMA_N = 16;
-  constexpr int bM = 128;
-  constexpr int bN = MMA_N;
-  constexpr int bK = 64;
-  constexpr int num_ab_stages = 8;
+  // The tile's token count (the MMA's N) and the stage counts that fit the
+  // shared memory with it are build settings: runtime_header.h derives them
+  // from MPK_LINEAR_MMA_N, and tma.cuh sizes the TMA boxes with the same
+  // macro.
+  char const *MMA_N = "MPK_LINEAR_MMA_N";
   constexpr int num_acc_stages = 2;
-  constexpr int num_c_stages = 4;
-  constexpr int num_tmem_columns = bN * num_acc_stages;
-  assert(num_tmem_columns <= 512);
   // define TMAs
   constexpr int B = 3;
   constexpr int M = 3;
@@ -2121,7 +2118,7 @@ int TaskRegister::register_linear_sm100_task(threadblock::Graph const &bgraph,
          1,                 /*SMEM_REPEAT_ROW_*/
          (TILE_SIZE + TMA_CP_ASYNC_SIZE - 1) /
              TMA_CP_ASYNC_SIZE,    /*SMEM_REPEAT_COL_*/
-         MMA_N * TMA_CP_ASYNC_SIZE /*SMEM_STRIDE_*/
+         "(MPK_LINEAR_MMA_N * 64)" /*SMEM_STRIDE_*/
   );
 
   code.e("using TMA_OUT = kernel::tma::tma_2d<cute::bfloat16_t, $, $, $, $, $, "
@@ -2138,8 +2135,8 @@ int TaskRegister::register_linear_sm100_task(threadblock::Graph const &bgraph,
          1,             /*GMEM_STRIDE_COL_*/
          1,             /*SMEM_REPEAT_ROW_*/
          (output_atom_size + output_tma_cp_size - 1) /
-             output_tma_cp_size, /*SMEM_REPEAT_COL_*/
-         MMA_N * MMA_M           /*SMEM_STRIDE_*/
+             output_tma_cp_size,    /*SMEM_REPEAT_COL_*/
+         "(MPK_LINEAR_MMA_N * 128)" /*SMEM_STRIDE_*/
   );
   code.inc_indent();
   code.e("TMA_A "
@@ -2174,9 +2171,9 @@ int TaskRegister::register_linear_sm100_task(threadblock::Graph const &bgraph,
          reduction_size,
          (with_residual && rank_with_residual) ? "false" : "true",
          /*SplitK=*/"false",
-         num_ab_stages,
+         "MPK_LINEAR_AB_STAGES",
          num_acc_stages,
-         num_c_stages);
+         "MPK_LINEAR_C_STAGES");
   code.e("    tma_a,");
   code.e("    tma_b,");
   code.e("    mBias,");
@@ -2226,15 +2223,12 @@ int TaskRegister::register_splitk_linear_sm100_task(
   code.inc_indent();
   // define MMA
   constexpr int MMA_M = 128;
-  constexpr int MMA_N = 16;
-  constexpr int bM = 128;
-  constexpr int bN = MMA_N;
-  constexpr int bK = 64;
-  constexpr int num_ab_stages = 8;
+  // The tile's token count (the MMA's N) and the stage counts that fit the
+  // shared memory with it are build settings: runtime_header.h derives them
+  // from MPK_LINEAR_MMA_N, and tma.cuh sizes the TMA boxes with the same
+  // macro.
+  char const *MMA_N = "MPK_LINEAR_MMA_N";
   constexpr int num_acc_stages = 2;
-  constexpr int num_c_stages = 4;
-  constexpr int num_tmem_columns = bN * num_acc_stages;
-  assert(num_tmem_columns <= 512);
   // define TMAs
   constexpr int B = 3;
   constexpr int M = 3;
@@ -2276,7 +2270,7 @@ int TaskRegister::register_splitk_linear_sm100_task(
          1,                 /*SMEM_REPEAT_ROW_*/
          (TILE_SIZE + TMA_CP_ASYNC_SIZE - 1) /
              TMA_CP_ASYNC_SIZE,    /*SMEM_REPEAT_COL_*/
-         MMA_N * TMA_CP_ASYNC_SIZE /*SMEM_STRIDE_*/
+         "(MPK_LINEAR_MMA_N * 64)" /*SMEM_STRIDE_*/
   );
 
   code.e("using TMA_OUT = kernel::tma::tma_2d<cute::bfloat16_t, $, $, $, $, $, "
@@ -2293,8 +2287,8 @@ int TaskRegister::register_splitk_linear_sm100_task(
          1,             /*GMEM_STRIDE_COL_*/
          1,             /*SMEM_REPEAT_ROW_*/
          (output_atom_size + output_tma_cp_size - 1) /
-             output_tma_cp_size, /*SMEM_REPEAT_COL_*/
-         MMA_N * MMA_M           /*SMEM_STRIDE_*/
+             output_tma_cp_size,    /*SMEM_REPEAT_COL_*/
+         "(MPK_LINEAR_MMA_N * 128)" /*SMEM_STRIDE_*/
   );
   code.inc_indent();
   code.e("TMA_A "
@@ -2327,9 +2321,9 @@ int TaskRegister::register_splitk_linear_sm100_task(
          reduction_size,
          with_residual ? "false" : "true",
          /*SplitK=*/"true",
-         num_ab_stages,
+         "MPK_LINEAR_AB_STAGES",
          num_acc_stages,
-         num_c_stages);
+         "MPK_LINEAR_C_STAGES");
   code.e("    tma_a,");
   code.e("    tma_b,");
   code.e("    mBias,");

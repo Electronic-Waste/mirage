@@ -717,7 +717,7 @@ __host__ inline void fill_tma_desc_by_task(CUtensorMap *tma_desc,
       constexpr int M = 3;
       constexpr int S = 3;
       constexpr int MMA_M = 128;
-      constexpr int MMA_N = 16;
+      constexpr int MMA_N = MPK_LINEAR_MMA_N;
 
       if (param_id == 0) {
         // TMA_INPUT: box must not exceed global dims
@@ -972,7 +972,7 @@ __host__ inline void fill_tma_desc_by_task(CUtensorMap *tma_desc,
       constexpr int M = 3;
       constexpr int S = 3;
       constexpr int MMA_M = 128;
-      constexpr int MMA_N = 16;
+      constexpr int MMA_N = MPK_LINEAR_MMA_N;
 
       if (param_id == 0) {
         // TMA_INPUT: box must not exceed global dims
